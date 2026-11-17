@@ -3,6 +3,7 @@ package os.aether.discipline.system
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
+import android.os.PowerManager
 import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -114,6 +115,13 @@ class LockActivity : ComponentActivity() {
                                     LockRuntime.suppressStop = true
                                     LockRuntime.persist(this@LockActivity)
                                     AlarmScheduler.relockAt(this@LockActivity, result.until)
+                                    runCatching {
+                                        ContextCompat.startForegroundService(
+                                            this@LockActivity,
+                                            android.content.Intent(this@LockActivity, EmergencyService::class.java)
+                                                .putExtra("until", result.until),
+                                        )
+                                    }
                                     applyTask(app)
                                     finish()
                                 }
@@ -148,8 +156,8 @@ class LockActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        val off = !window.decorView.isShown || !getSystemService(android.os.PowerManager::class.java).isInteractive
-        if (LockRuntime.suppressStop || LockRuntime.screenOff || off || LockRuntime.mode != LockRuntime.LOCKED) {
+        val interactive = getSystemService(PowerManager::class.java).isInteractive
+        if (LockRuntime.suppressStop || !interactive || LockRuntime.mode != LockRuntime.LOCKED) {
             LockRuntime.suppressStop = false
         } else {
             (application as AetherApp).scope.launch {
@@ -161,17 +169,26 @@ class LockActivity : ComponentActivity() {
 
     private suspend fun applyTask(app: AetherApp) {
         val t = app.repo.loadThresholds()
-        val packages = if (LockRuntime.inEmergency()) {
-            (t.whitelistPackages + packageName).distinct()
+        val emergency = LockRuntime.inEmergency()
+        val packages = if (emergency) {
+            (t.whitelistPackages + packageName + launcherPackage(this)).distinct()
         } else {
             (AlwaysLockPackages + packageName).distinct()
         }
         LockRuntime.whitelist = packages.toSet()
-        DeviceOwnerCtl.apply(this, packages.toTypedArray())
+        DeviceOwnerCtl.apply(this, packages.toTypedArray(), emergency = emergency)
         runCatching { startLockTask() }
     }
 
+    /** In emergency mode the launcher must stay reachable, otherwise finishing the lock UI leaves the phone on a blank screen. */
+    private fun launcherPackage(context: android.content.Context): String =
+        context.packageManager.resolveActivity(
+            android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_HOME),
+            android.content.pm.PackageManager.MATCH_DEFAULT_ONLY,
+        )?.activityInfo?.packageName.orEmpty()
+
     private fun releaseAndFinish() {
+        stopService(android.content.Intent(this, EmergencyService::class.java))
         LockRuntime.mode = LockRuntime.OFF
         LockRuntime.persist(this)
         DeviceOwnerCtl.release(this)

@@ -65,8 +65,9 @@ class LocationService : Service() {
             return START_NOT_STICKY
         }
         val type = intent?.getStringExtra("type") ?: "RUN"
+        val resumed = intent == null
         job?.cancel()
-        job = scope.launch { track(type) }
+        job = scope.launch { track(type, resumed) }
         return START_STICKY
     }
 
@@ -76,10 +77,12 @@ class LocationService : Service() {
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun track(type: String) {
+    private suspend fun track(type: String, resumed: Boolean) {
         val app = application as AetherApp
         val date = os.aether.discipline.data.AetherRepository.todayString()
-        val id = app.repo.db.gps().insert(
+        // A START_STICKY restart must attach to the unfinished row instead of creating a duplicate.
+        val existing = if (resumed) app.repo.db.gps().latest()?.takeIf { !it.finished } else null
+        val id = existing?.id ?: app.repo.db.gps().insert(
             GpsWorkout(
                 date = date,
                 startTime = System.currentTimeMillis(),
@@ -91,9 +94,10 @@ class LocationService : Service() {
                 routeGeoJson = """{"type":"LineString","coordinates":[]}""",
             ),
         )
-        val started = System.currentTimeMillis()
+        WorkoutBus.state.value = WorkoutLive(active = true, id = id, type = type)
+        val started = existing?.startTime ?: System.currentTimeMillis()
         val points = mutableListOf<Pair<Double, Double>>()
-        var meters = 0f
+        var meters = existing?.distanceMeters ?: 0f
         listenSteps()
         val client = runCatching { LocationServices.getFusedLocationProviderClient(this) }.getOrElse {
             WorkoutBus.state.value = WorkoutLive(message = "这台机器没有可用的定位服务")
@@ -121,20 +125,30 @@ class LocationService : Service() {
                 val cadence = if (lastSteps > stepsStart && stepsStart >= 0) ((lastSteps - stepsStart) / minutes).toInt() else 0
                 WorkoutBus.state.value = WorkoutLive(true, id, type, meters, seconds, points.toList(), cadence)
                 if (points.size % 5 == 0) {
-                    scope.launch(Dispatchers.IO) { persist(app, id, type, meters, seconds, points, cadence, false) }
+                    val snapshot = points.toList()
+                    scope.launch(Dispatchers.IO) { persist(app, id, type, meters, seconds, snapshot, cadence, false) }
                 }
             }
         }
-        client.requestLocationUpdates(request, callback, mainLooper)
+        val startedUpdates = runCatching {
+            client.requestLocationUpdates(request, callback, mainLooper)
+        }
+        if (startedUpdates.isFailure) {
+            WorkoutBus.state.value = WorkoutLive(message = "定位权限或定位服务不可用")
+            stopSelf()
+            return
+        }
         // location updates stay registered until the service stops
         kotlinx.coroutines.awaitCancellation()
     }
 
     private suspend fun finish() {
         val live = WorkoutBus.state.value
-        if (live.id == 0L) return
         val app = application as AetherApp
-        persist(app, live.id, live.type, live.meters, live.seconds, live.points, live.cadence, true)
+        val id = live.id.takeIf { it != 0L }
+            ?: app.repo.db.gps().latest()?.takeIf { !it.finished }?.id
+            ?: return
+        persist(app, id, live.type, live.meters, live.seconds, live.points, live.cadence, true)
         val pace = paceLabel(live.meters, live.seconds)
         val kind = if (live.type == "RUN") "跑了" else "走了"
         app.repo.saveMessage("ASSISTANT", "今天$kind ${"%.2f".format(live.meters / 1000f)} 公里，配速 $pace。")
@@ -152,7 +166,9 @@ class LocationService : Service() {
         finished: Boolean,
     ) {
         val row = app.repo.db.gps().get(id) ?: return
-        val kg = app.repo.loadThresholds().targetWeightKg ?: 70f
+        val kg = app.repo.db.weight().latest()?.weightKg
+            ?: app.repo.loadThresholds().targetWeightKg
+            ?: 70f
         val coords = points.joinToString(",") { "[${it.second},${it.first}]" }
         app.repo.db.gps().update(
             row.copy(
@@ -162,7 +178,7 @@ class LocationService : Service() {
                 caloriesBurned = workoutKcal(type, kg, meters),
                 avgCadenceSpm = cadence,
                 finished = finished,
-                routeGeoJson = """{"type":"LineString","coordinates":[$coords]}""",
+                routeGeoJson = if (points.isEmpty()) row.routeGeoJson else """{"type":"LineString","coordinates":[$coords]}""",
             ),
         )
     }

@@ -246,6 +246,7 @@ fun defaultThresholds(): List<UserThreshold> {
         row("scene_tts_provider", "", "STRING", "云端音色渠道"),
         row("scene_tts_model", "", "STRING", "云端音色模型"),
         row("scene_tts_path", "/audio/speech", "STRING", "云端 TTS 路径"),
+        row("last_settled_date", "", "STRING", "上次结算日期"),
         row("lock_strength", "UNKNOWN", "STRING", "锁屏强度"),
     )
 }

@@ -1,5 +1,6 @@
 package os.aether.discipline.data.db
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
@@ -230,6 +231,9 @@ data class CustomLearningModule(
     val countsTowardsStreak: Boolean,
     val isArchived: Boolean = false,
     val sortOrder: Int,
+    /** YYYY-MM-DD that [currentValue] belongs to. Empty means no progress yet. */
+    @ColumnInfo(defaultValue = "''")
+    val progressDate: String = "",
 )
 
 @Entity(tableName = "finance_quotes")

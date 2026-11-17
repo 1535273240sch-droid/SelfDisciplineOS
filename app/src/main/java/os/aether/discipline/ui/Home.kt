@@ -3,6 +3,7 @@ package os.aether.discipline.ui
 import android.Manifest
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -49,6 +50,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -61,8 +63,14 @@ import org.json.JSONObject
 import os.aether.discipline.AetherApp
 import os.aether.discipline.data.AetherRepository
 import os.aether.discipline.data.TodayUi
+import os.aether.discipline.domain.inLockWindow
+import os.aether.discipline.domain.mealTypeFor
+import os.aether.discipline.system.LockActivity
+import os.aether.discipline.system.LockRuntime
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.time.LocalDateTime
+import java.time.LocalTime
 
 private val android.content.Context.uiStore by preferencesDataStore("aether_ui")
 private val themeKey = stringPreferencesKey("theme")
@@ -72,6 +80,15 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val repo = (application as AetherApp).repo
+        lifecycleScope.launch {
+            runCatching {
+                val t = repo.loadThresholds()
+                if (LockRuntime.mode == LockRuntime.LOCKED && inLockWindow(LocalDateTime.now(), t)) {
+                    startActivity(android.content.Intent(this@MainActivity, LockActivity::class.java))
+                    finish()
+                }
+            }
+        }
         setContent {
             val theme by this@MainActivity.uiStore.data.map { it[themeKey] ?: "frost" }.collectAsStateWithLifecycle(initialValue = "frost")
             var voice by remember { mutableStateOf(false) }
@@ -95,13 +112,29 @@ class MainActivity : ComponentActivity() {
                             composable("workout") { WorkoutScreen() }
                             composable("calisthenics") { CalisthenicsScreen(repo) }
                             composable("thresholds") { ThresholdScreen(repo) }
+                            composable("backfill") { BackfillScreen(repo) }
                             composable("providers") { ProviderScreen(repo) }
                             composable("root") { RootScreen(repo) }
                         }
                     }
                     if (!voice) {
                         Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
-                            FloatingDock(nav) { voice = true }
+                            FloatingDock(
+                                nav,
+                                onVoice = { voice = true },
+                                onLock = {
+                                    this@MainActivity.lifecycleScope.launch {
+                                        runCatching {
+                                            val t = repo.loadThresholds()
+                                            if (LockRuntime.mode == LockRuntime.LOCKED || inLockWindow(LocalDateTime.now(), t)) {
+                                                startActivity(android.content.Intent(this@MainActivity, LockActivity::class.java))
+                                            } else {
+                                                Toast.makeText(this@MainActivity, "现在不是锁屏时段", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    }
+                                },
+                            )
                         }
                     }
                     if (voice) {
@@ -117,17 +150,17 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit) {
+private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit, onLock: () -> Unit) {
     val colors = LocalAether.current
     val current = nav.currentBackStackEntryAsState().value?.destination?.route
     Box(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 20.dp, end = 20.dp, bottom = 16.dp)) {
         DockSurface(Modifier.fillMaxWidth().height(58.dp)) {
             Row(Modifier.fillMaxSize().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                DockItem("今日", "today", current, nav, Modifier.weight(1f))
-                DockItem("学习", "lab", current, nav, Modifier.weight(1f))
+                DockItem("今日", "today", current, nav, Modifier.weight(1f), onLock)
+                DockItem("学习", "lab", current, nav, Modifier.weight(1f), onLock)
                 Spacer(Modifier.size(64.dp))
-                DockItem("设置", "settings", current, nav, Modifier.weight(1f))
-                DockItem("锁屏", "lock", current, nav, Modifier.weight(1f))
+                DockItem("设置", "settings", current, nav, Modifier.weight(1f), onLock)
+                DockItem("锁屏", "lock", current, nav, Modifier.weight(1f), onLock)
             }
         }
         Box(
@@ -143,12 +176,18 @@ private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit) {
 }
 
 @Composable
-private fun DockItem(label: String, route: String, current: String?, nav: NavHostController, modifier: Modifier) {
-    val context = LocalContext.current
+private fun DockItem(
+    label: String,
+    route: String,
+    current: String?,
+    nav: NavHostController,
+    modifier: Modifier,
+    onLock: () -> Unit,
+) {
     val colors = LocalAether.current
     Box(modifier.clickable {
         if (route == "lock") {
-            context.startActivity(android.content.Intent(context, os.aether.discipline.system.LockActivity::class.java))
+            onLock()
         } else {
             nav.navigate(route) { launchSingleTop = true; popUpTo("today") }
         }
@@ -308,15 +347,18 @@ private suspend fun applyVision(repo: AetherRepository, text: String, kind: Stri
     if (kind == "scale") {
         if (!json.isNull("kg")) repo.recordWeight(json.optDouble("kg").toFloat(), true, "SCALE_OCR")
     } else {
-        repo.recordDiet(
-            "LUNCH",
-            json.optString("items"),
-            json.optInt("calories"),
-            json.optDouble("protein_g").toFloat(),
-            json.optDouble("carbs_g").toFloat(),
-            json.optDouble("fat_g").toFloat(),
-            needsBackfill = json.optInt("calories") == 0,
-        )
+        val items = json.optString("items").trim()
+        if (items.isNotBlank()) {
+            repo.recordDiet(
+                mealTypeFor(LocalTime.now().hour),
+                items,
+                json.optInt("calories"),
+                json.optDouble("protein_g").toFloat(),
+                json.optDouble("carbs_g").toFloat(),
+                json.optDouble("fat_g").toFloat(),
+                needsBackfill = json.optInt("calories") == 0,
+            )
+        }
     }
 }
 
@@ -363,6 +405,7 @@ private fun Settings(nav: NavHostController) {
         }
         GlassCard(Modifier.clickable { nav.navigate("providers") }) { Body("模型路由") }
         GlassCard(Modifier.clickable { nav.navigate("thresholds") }) { Body("数据与阈值") }
+        GlassCard(Modifier.clickable { nav.navigate("backfill") }) { Body("补录过去的数据") }
         GlassCard(Modifier.clickable { nav.navigate("root") }) { Body("Root 与锁屏") }
         Quiet("云端朗读会把回复文本再发一次。题库导入在驾考页，不提供导出。")
     }

@@ -3,6 +3,8 @@ package os.aether.discipline.data
 import android.content.Context
 import android.os.SystemClock
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -46,6 +48,7 @@ import os.aether.discipline.domain.SYSTEM_PROMPT
 import os.aether.discipline.domain.Thresholds
 import os.aether.discipline.domain.answersMatch
 import os.aether.discipline.domain.buildDailyPaper
+import os.aether.discipline.domain.carriedStreak
 import os.aether.discipline.domain.decideDay
 import os.aether.discipline.domain.examPhase
 import os.aether.discipline.domain.inLockWindow
@@ -107,6 +110,7 @@ data class TodayUi(
     val hardTitle: String = "今日硬指标",
     val hardHint: String = "",
     val hardDetail: String = "",
+    val hardUnit: String = "题",
     val weightValue: String = "—",
     val deltaText: String = "",
     val deltaDown: Boolean = true,
@@ -134,6 +138,8 @@ data class EmergencyResult(val ok: Boolean, val message: String, val until: Long
 
 class AetherRepository(context: Context) {
     private val app = context.applicationContext
+    private val settleMutex = Mutex()
+    private val seedMutex = Mutex()
     val db: AppDatabase = AppDatabase.get(app)
     val ai = OpenAiClient()
     val messages = db.ai().observeMessages()
@@ -141,6 +147,7 @@ class AetherRepository(context: Context) {
     val thresholdRows = db.thresholds().observe()
 
     suspend fun ensureSeed() = withContext(Dispatchers.IO) {
+        seedMutex.withLock {
         defaultThresholds().forEach { row ->
             if (db.thresholds().get(row.key) == null) db.thresholds().upsert(row)
         }
@@ -160,6 +167,23 @@ class AetherRepository(context: Context) {
                 db.ai().upsertMemory(AiMemoryProfile(key, "", System.currentTimeMillis()))
             }
         }
+        val lastSettled = db.thresholds().get("last_settled_date")
+        val today = LocalDate.now()
+        val yesterday = today.minusDays(1).toString()
+        val lastFinal = db.streak().previousFinal(today.toString())
+        val latestRow = db.streak().latest()
+        val initialSettled = when {
+            lastFinal != null -> lastFinal.date
+            latestRow != null -> runCatching {
+                minOf(LocalDate.parse(latestRow.date), today.minusDays(1)).minusDays(1).toString()
+            }.getOrDefault(yesterday)
+            else -> yesterday
+        }
+        if (lastSettled == null) {
+            db.thresholds().upsert(UserThreshold("last_settled_date", initialSettled, "STRING", "上次结算日期", null, System.currentTimeMillis()))
+        } else if (lastSettled.value.isBlank()) {
+            db.thresholds().upsert(lastSettled.copy(value = initialSettled, updatedAt = System.currentTimeMillis()))
+        }
         syncPlan()
         if (db.learning().ordered().isEmpty()) {
             listOf(
@@ -178,11 +202,31 @@ class AetherRepository(context: Context) {
                 FinanceQuote(quoteText = "原则是把决策写成可以反复执行的规则，而不是每次重新靠感觉。", bookTitle = "原则", author = "瑞·达利欧"),
             ).forEach { db.quotes().insert(it) }
         }
+        }
     }
 
     suspend fun today(): TodayUi = withContext(Dispatchers.IO) { buildToday() }
 
-    suspend fun modules(): List<CustomLearningModule> = db.learning().ordered()
+    suspend fun modules(): List<CustomLearningModule> {
+        val t = loadThresholds()
+        val today = todayString()
+        val phase = examPhase(LocalDate.now(), t.examDate)
+        return db.learning().ordered().map { row ->
+            when (row.moduleId) {
+                "driving" -> row.copy(
+                    targetValue = t.dailyDriving,
+                    currentValue = if (phase == ExamPhase.MOCK) db.driving().finishedSessions(today) else db.driving().realtimeAttempts(today),
+                    progressDate = today,
+                )
+                "english" -> row.copy(
+                    targetValue = t.dailyEnglish,
+                    currentValue = db.english().count(today),
+                    progressDate = today,
+                )
+                else -> if (row.progressDate == today) row else row.copy(currentValue = 0)
+            }
+        }
+    }
 
     suspend fun moveModule(id: String, direction: Int) {
         val rows = db.learning().ordered().toMutableList()
@@ -196,13 +240,16 @@ class AetherRepository(context: Context) {
     }
 
     suspend fun setHardModule(id: String) {
+        val row = db.learning().get(id) ?: return
+        if (row.isArchived) return
         db.learning().clearHardFlags()
-        db.learning().get(id)?.let { db.learning().upsert(it.copy(countsTowardsStreak = true)) }
+        db.learning().upsert(row.copy(countsTowardsStreak = true))
         recompute(todayString(), false)
     }
 
     suspend fun setArchived(id: String, archived: Boolean) {
         db.learning().get(id)?.let { db.learning().upsert(it.copy(isArchived = archived)) }
+        recompute(todayString(), false)
     }
 
     suspend fun addModule(title: String, target: Int, template: String): String {
@@ -219,6 +266,7 @@ class AetherRepository(context: Context) {
                 unit = if (template == "COUNTDOWN_SPRINT") "天" else "次",
                 countsTowardsStreak = false,
                 sortOrder = order,
+                progressDate = "",
             ),
         )
         return id
@@ -226,14 +274,19 @@ class AetherRepository(context: Context) {
 
     suspend fun bumpModule(id: String, amount: Int) {
         val row = db.learning().get(id) ?: return
-        db.learning().upsert(row.copy(currentValue = (row.currentValue + amount).coerceAtMost(row.targetValue.coerceAtLeast(1))))
-        recompute(todayString(), false)
+        val today = todayString()
+        val base = if (row.progressDate == today) row.currentValue else 0
+        val target = row.targetValue.coerceAtLeast(1)
+        val next = (base + amount.coerceAtLeast(0)).coerceIn(0, target)
+        db.learning().upsert(row.copy(currentValue = next, progressDate = today))
+        recompute(today, false)
     }
 
     suspend fun markCryptoReviewed() {
         val row = db.learning().get("crypto") ?: return
-        db.learning().upsert(row.copy(currentValue = row.targetValue.coerceAtLeast(1)))
-        recompute(todayString(), false)
+        val today = todayString()
+        db.learning().upsert(row.copy(currentValue = row.targetValue.coerceAtLeast(1), progressDate = today))
+        recompute(today, false)
     }
 
     suspend fun quotes(): List<FinanceQuote> = db.quotes().all()
@@ -251,11 +304,55 @@ class AetherRepository(context: Context) {
 
     suspend fun refreshCrypto(): CryptoBoard = CryptoMarket.load()
 
-    suspend fun saveThreshold(key: String, value: String) = withContext(Dispatchers.IO) {
-        val existing = db.thresholds().get(key) ?: return@withContext
-        db.thresholds().upsert(existing.copy(value = value.trim(), updatedAt = System.currentTimeMillis()))
+    suspend fun saveThreshold(key: String, value: String): String = withContext(Dispatchers.IO) {
+        val existing = db.thresholds().get(key) ?: return@withContext "未知设置项：$key"
+        val raw = value.trim()
+        val normalized = when (existing.valueType) {
+            "TIME" -> normalizeClock(raw) ?: return@withContext "时间要写成 HH:mm"
+            "DATE" -> if (raw.isBlank()) "" else {
+                runCatching { LocalDate.parse(raw) }.getOrNull()?.toString()
+                    ?: return@withContext "日期要写成 YYYY-MM-DD"
+            }
+            "INT" -> if (raw.isBlank()) "" else {
+                val n = raw.toIntOrNull() ?: return@withContext "需要整数"
+                if (n < 0) return@withContext "不能是负数"
+                n.toString()
+            }
+            "FLOAT" -> if (raw.isBlank()) "" else {
+                val n = raw.toFloatOrNull() ?: return@withContext "需要数字"
+                if (n < 0f) return@withContext "不能是负数"
+                n.toString()
+            }
+            "BOOL" -> {
+                if (raw != "true" && raw != "false") return@withContext "只接受 true / false"
+                raw
+            }
+            else -> raw
+        }
+        if (key == "daily_driving_target" && (normalized.toIntOrNull() ?: 0) <= 0) {
+            return@withContext "每日题量要大于 0"
+        }
+        if (key == "daily_english_sentences" && (normalized.toIntOrNull() ?: 0) !in 5..8) {
+            return@withContext "英语句数只能是 5–8"
+        }
+        db.thresholds().upsert(existing.copy(value = normalized, updatedAt = System.currentTimeMillis()))
         if (key == "exam_date" || key == "daily_driving_target") syncPlan()
+        if (key == "weekday_lock_time" || key == "weekend_lock_time") refreshTodaySleepDeadline()
         recompute(todayString(), false)
+        "已保存"
+    }
+
+    /** Re-evaluate today's sleep when the lock deadline is edited, so the card and verdict change immediately. */
+    private suspend fun refreshTodaySleepDeadline() {
+        val date = todayString()
+        val sleep = db.sleep().get(date) ?: return
+        val actual = sleep.actualSleepTime ?: return
+        val t = loadThresholds()
+        val deadline = lockTime(LocalDate.parse(date), t).hhmm()
+        val late = isLateSleep(actual, deadline)
+        db.sleep().upsert(sleep.copy(lockDeadline = deadline, isLateSleep = late))
+        db.violations().deleteType(date, "LATE_SLEEP")
+        if (late && !sleep.isBackfill) addViolation(date, "LATE_SLEEP", "超过红线 ${minutesLate(actual, deadline)} 分钟", true)
     }
 
     suspend fun setPin(pin: String): String = withContext(Dispatchers.IO) {
@@ -274,32 +371,47 @@ class AetherRepository(context: Context) {
     }
 
     suspend fun recordWeight(kg: Float, fasting: Boolean, source: String, backfill: Boolean = false, date: String = todayString()) {
-        db.weight().insert(WeightRecord(date = date, timestamp = System.currentTimeMillis(), weightKg = kg, isFasting = fasting, source = source, isBackfill = backfill))
+        if (kg.isNaN() || kg !in 30f..250f) return
+        db.weight().insert(
+            WeightRecord(
+                date = date,
+                timestamp = System.currentTimeMillis(),
+                weightKg = kg,
+                isFasting = fasting,
+                source = source,
+                isBackfill = backfill || date != todayString(),
+            ),
+        )
         putRaw("current_weight_kg", kg.toString())
         recompute(date, false)
     }
 
     suspend fun recordSleep(sleep: String, wake: String?, sourceBackfill: Boolean = false, date: String = todayString()) {
+        val normalized = normalizeClock(sleep) ?: return
+        val normalizedWake = normalizeClock(wake)
         val day = LocalDate.parse(date)
         val t = loadThresholds()
         val deadline = lockTime(day, t).hhmm()
-        val late = isLateSleep(sleep, deadline)
+        val late = isLateSleep(normalized, deadline)
         val existing = db.sleep().get(date)
+        val isBackfill = date != todayString() || (existing?.isBackfill ?: sourceBackfill)
         db.sleep().upsert(
             SleepRecord(
                 date = date,
-                actualSleepTime = sleep,
-                wakeUpTime = wake ?: existing?.wakeUpTime ?: wakeTime(day, t).hhmm(),
+                actualSleepTime = normalized,
+                wakeUpTime = normalizedWake ?: existing?.wakeUpTime ?: wakeTime(day, t).hhmm(),
                 isLateSleep = late,
                 emergencyUnlockUsed = existing?.emergencyUnlockUsed ?: false,
                 emergencyUnlockDurationMin = existing?.emergencyUnlockDurationMin ?: 0,
                 lockDeadline = deadline,
                 gaveUpTonight = existing?.gaveUpTonight ?: false,
                 rebootedDuringLock = existing?.rebootedDuringLock ?: false,
-                isBackfill = sourceBackfill,
+                isBackfill = isBackfill,
             ),
         )
-        if (late) addViolation(date, "LATE_SLEEP", "超过红线 ${minutesLate(sleep, deadline)} 分钟", true)
+        // Re-editing last night's time should also be able to clear an old typo.
+        db.violations().deleteType(date, "LATE_SLEEP")
+        if (late && !isBackfill) addViolation(date, "LATE_SLEEP", "超过红线 ${minutesLate(normalized, deadline)} 分钟", true)
         recompute(date, false)
     }
 
@@ -320,48 +432,52 @@ class AetherRepository(context: Context) {
                 date = date,
                 timestamp = System.currentTimeMillis(),
                 mealType = meal,
-                description = description,
-                calories = calories,
-                proteinG = protein,
-                carbsG = carbs,
-                fatG = fat,
+                description = description.trim(),
+                calories = calories.coerceAtLeast(0),
+                proteinG = protein.coerceAtLeast(0f),
+                carbsG = carbs.coerceAtLeast(0f),
+                fatG = fat.coerceAtLeast(0f),
                 imageUri = image,
                 needsBackfill = needsBackfill,
-                isBackfill = backfill,
+                isBackfill = backfill || date != todayString(),
             ),
         )
         recompute(date, false)
     }
 
     suspend fun recordCalisthenics(category: String, step: Int, sets: Int, reps: Int, backfill: Boolean = false, date: String = todayString()): String {
-        val current = db.calisthenics().get(category)
-        val useStep = if (step in 1..10) step else current?.currentStep ?: 1
+        val key = category.trim().uppercase().replace(' ', '_')
+        val current = db.calisthenics().get(key)
+        val useStep = (if (step in 1..10) step else current?.currentStep ?: 1).coerceIn(1, 10)
+        val gate = runCatching { stepOf(key, useStep) }.getOrNull()
+            ?: return "动作分类不认识：$category"
         db.calisthenics().insertLog(
             CalisthenicsLog(
                 date = date,
                 timestamp = System.currentTimeMillis(),
-                moveCategory = category,
+                moveCategory = key,
                 stepNumber = useStep,
-                sets = sets,
-                repsPerSet = reps,
-                isBackfill = backfill,
+                sets = sets.coerceAtLeast(0),
+                repsPerSet = reps.coerceAtLeast(0),
+                isBackfill = backfill || date != todayString(),
             ),
         )
-        val gate = stepOf(category, useStep)
-        val ready = sets >= gate.upSets && reps >= gate.upReps
+        val safeSets = sets.coerceAtLeast(0)
+        val safeReps = reps.coerceAtLeast(0)
+        val ready = safeSets >= gate.upSets && safeReps >= gate.upReps
         val next = if (ready && useStep < 10) useStep + 1 else useStep
-        val nextDef = stepOf(category, next)
+        val nextDef = stepOf(key, next)
         db.calisthenics().upsert(
             CalisthenicsProgress(
-                moveCategory = category,
+                moveCategory = key,
                 currentStep = next,
                 currentStepName = nextDef.name,
-                bestSets = maxOf(current?.bestSets ?: 0, sets),
-                bestReps = maxOf(current?.bestReps ?: 0, reps),
+                bestSets = maxOf(current?.bestSets ?: 0, safeSets),
+                bestReps = maxOf(current?.bestReps ?: 0, safeReps),
                 isReadyToLevelUp = ready && useStep == 10,
             ),
         )
-        return if (ready && next != useStep) "达到升级标准，${categoryLabel(category)}进入第 $next 式 ${nextDef.name}" else "已记下 ${categoryLabel(category)} 第 $useStep 式"
+        return if (ready && next != useStep) "达到升级标准，${categoryLabel(key)}进入第 $next 式 ${nextDef.name}" else "已记下 ${categoryLabel(key)} 第 $useStep 式"
     }
 
     suspend fun commitLocal(text: String): String {
@@ -388,18 +504,26 @@ class AetherRepository(context: Context) {
     suspend fun executeTool(name: String, arguments: String): String {
         val args = runCatching { JSONObject(arguments.ifBlank { "{}" }) }.getOrElse { JSONObject() }
         return when (name) {
-            "record_weight" -> {
-                recordWeight(args.optDouble("weight_kg").toFloat(), args.optBoolean("is_fasting", true), "VOICE")
+            "record_weight" -> runCatching {
+                val kg = args.optDouble("weight_kg")
+                if (kg.isNaN() || kg !in 30.0..250.0) error("体重需要在 30–250kg 之间")
+                recordWeight(kg.toFloat(), args.optBoolean("is_fasting", true), "VOICE")
                 "已记录体重"
-            }
-            "record_sleep" -> {
-                recordSleep(args.optString("sleep_time"), args.optString("wake_time").ifBlank { null })
+            }.getOrElse { "体重未记录：${it.message}" }
+            "record_sleep" -> runCatching {
+                val sleep = args.optString("sleep_time")
+                if (normalizeClock(sleep) == null) error("入睡时间要写成 HH:mm")
+                recordSleep(sleep, args.optString("wake_time").ifBlank { null })
                 "已记录作息"
-            }
-            "record_diet" -> {
+            }.getOrElse { "作息未记录：${it.message}" }
+            "record_diet" -> runCatching {
+                val items = args.optString("items").trim()
+                if (items.isBlank()) error("缺少吃了什么")
+                val meal = args.optString("meal_type", "SNACK").uppercase()
+                    .takeIf { it in setOf("BREAKFAST", "LUNCH", "DINNER", "SNACK") } ?: "SNACK"
                 recordDiet(
-                    args.optString("meal_type", "SNACK"),
-                    args.optString("items"),
+                    meal,
+                    items,
                     args.optInt("calories"),
                     args.optDouble("protein_g").toFloat(),
                     args.optDouble("carbs_g").toFloat(),
@@ -407,17 +531,25 @@ class AetherRepository(context: Context) {
                     needsBackfill = args.optInt("calories") == 0,
                 )
                 "已记录饮食"
-            }
-            "record_calisthenics" -> recordCalisthenics(
-                args.optString("category", "PUSHUP"),
-                args.optInt("step"),
-                args.optInt("sets", 1),
-                args.optInt("reps"),
-            )
-            "render_analytics_widget" -> analyticsPayload(args.optInt("days", 14))
+            }.getOrElse { "饮食未记录：${it.message}" }
+            "record_calisthenics" -> runCatching {
+                val sets = args.optInt("sets", 1)
+                val reps = args.optInt("reps")
+                if (sets <= 0 || reps < 0) error("组数和次数不合法")
+                recordCalisthenics(
+                    args.optString("category", "PUSHUP"),
+                    args.optInt("step"),
+                    sets,
+                    reps,
+                )
+            }.getOrElse { "训练未记录：${it.message}" }
+            "render_analytics_widget" -> analyticsPayload(args.optInt("days", 14).coerceIn(1, 90))
             "remember" -> {
-                db.ai().upsertMemory(AiMemoryProfile(args.optString("key"), args.optString("value"), System.currentTimeMillis()))
-                "已记住"
+                val key = args.optString("key").trim()
+                if (key.isBlank()) "记忆键不能为空" else {
+                    db.ai().upsertMemory(AiMemoryProfile(key, args.optString("value").trim(), System.currentTimeMillis()))
+                    "已记住"
+                }
             }
             else -> "未知工具"
         }
@@ -650,6 +782,41 @@ class AetherRepository(context: Context) {
         if (!row.weightLogged || !row.dietLogged || !row.sleepRecorded) addViolation(date, "DATA_NOT_LOGGED", "体重、饮食或作息缺实时记录", true)
     }
 
+    /**
+     * Finalize every day between the last settled date and yesterday.
+     * This is what makes "不达标就不掉链" actually true even when the app was never opened.
+     */
+    suspend fun settleMissedDays() = withContext(Dispatchers.IO) {
+        settleMutex.withLock {
+            val today = LocalDate.now()
+            val end = today.minusDays(1)
+            val meta = raw("last_settled_date").let { runCatching { LocalDate.parse(it) }.getOrNull() }
+            val latest = db.streak().latest()
+            val latestDate = latest?.date?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+            val lastFinal = db.streak().previousFinal(today.toString())
+            val start = when {
+                meta != null -> meta.plusDays(1)
+                lastFinal != null -> LocalDate.parse(lastFinal.date).plusDays(1)
+                latest != null && latestDate != null -> minOf(latestDate, end)
+                else -> null
+            }
+            if (start == null) {
+                // Brand-new install: do not invent a broken day before the app was ever used.
+                putRaw("last_settled_date", end.toString())
+                recompute(today.toString(), false)
+                return@withLock
+            }
+            var cursor = if (start.isBefore(end.minusDays(366))) end.minusDays(366) else start
+            while (!cursor.isAfter(end)) {
+                finalizeDate(cursor.toString())
+                cursor = cursor.plusDays(1)
+            }
+            putRaw("last_settled_date", end.toString())
+            // Refresh today's carried streak now that yesterday is final.
+            recompute(today.toString(), false)
+        }
+    }
+
     suspend fun giveUp(date: String = todayString()) {
         addViolation(date, "GAVE_UP_TONIGHT", "按了今晚放弃", true)
         val sleep = db.sleep().get(date)
@@ -743,8 +910,8 @@ class AetherRepository(context: Context) {
         val key = date.toString()
         val now = LocalDateTime.now()
         val weights = db.weight().recent(12)
-        val latest = weights.firstOrNull()
-        val previous = weights.drop(1).firstOrNull { it.date != latest?.date }
+        val todayWeight = weights.firstOrNull { it.date == key }
+        val previous = todayWeight?.let { weights.firstOrNull { row -> row.date != key } }
         val sleep = db.sleep().get(key)
         val diets = db.diet().forDate(key)
         val phase = examPhase(date, t.examDate)
@@ -759,13 +926,15 @@ class AetherRepository(context: Context) {
         val sleepPass = sleep?.let { !it.isLateSleep }
         val hard = listOf(sleepPass == true, drivingMet, dataMet).count { it }
         val streakRow = db.streak().get(key)
+        val previousFinal = db.streak().previousFinal(key)
+        val carried = carriedStreak(key, previousFinal?.date, previousFinal?.status, previousFinal?.streakValue ?: 0)
         val displayStreak = when (streakRow?.status) {
             "BROKEN" -> 0
             "MET", "BACKFILL_ONLY" -> streakRow.streakValue
-            else -> db.streak().previousFinal(key)?.streakValue ?: 0
+            else -> carried.second
         }
-        val delta = if (latest != null && previous != null) {
-            val diff = latest.weightKg - previous.weightKg
+        val delta = if (todayWeight != null && previous != null) {
+            val diff = todayWeight.weightKg - previous.weightKg
             if (diff > 0) "↑${"%.1f".format(diff)}" else "↓${"%.1f".format(-diff)}"
         } else ""
         val briefing = db.briefings().get(key)
@@ -788,11 +957,12 @@ class AetherRepository(context: Context) {
             status = streakRow?.status ?: "PENDING",
             countdown = if (locked) "锁屏中" else "${hours}小时${mins}分",
             countdownClock = if (locked) "00:00" else "%02d:%02d".format(hours, mins),
-            lockCaption = if (next.hour == 1) "今晚 01:00 锁定" else "今晚 00:00 锁定",
+            lockCaption = "今晚 %02d:%02d 锁定".format(next.hour, next.minute),
             guardText = if (locked) "锁屏守卫中" else "正常守卫中",
             hardTitle = hardNow.title,
             hardHint = hardNow.hint,
             hardDetail = hardNow.detail,
+            hardUnit = hardNow.unit,
             inLock = locked,
             sleepText = sleepConclusion(sleep?.actualSleepTime, sleep?.lockDeadline ?: lockTime(date, t).hhmm(), !t.excludePrivacy),
             sleepOk = sleepPass,
@@ -800,14 +970,14 @@ class AetherRepository(context: Context) {
             drivingTarget = drivingTarget,
             drivingMet = drivingMet,
             phase = phase.name,
-            weightText = latest?.let { "${it.weightKg} kg" } ?: "未记录",
-            weightValue = latest?.let { "%.1f".format(it.weightKg) } ?: "—",
+            weightText = todayWeight?.let { "${it.weightKg} kg" } ?: "未记录",
+            weightValue = todayWeight?.let { "%.1f".format(it.weightKg) } ?: "—",
             weightDelta = delta,
-            deltaText = if (latest != null && previous != null) {
-                val diff = latest.weightKg - previous.weightKg
+            deltaText = if (todayWeight != null && previous != null) {
+                val diff = todayWeight.weightKg - previous.weightKg
                 "${if (diff > 0) "+" else ""}${"%.1f".format(diff)} kg"
-            } else "还没有对照",
-            deltaDown = latest == null || previous == null || latest.weightKg <= previous.weightKg,
+            } else "今日还没称",
+            deltaDown = todayWeight == null || previous == null || todayWeight.weightKg <= previous.weightKg,
             calories = diets.sumOf { it.calories },
             calorieLimit = t.calorieLimit,
             protein = diets.sumOf { it.proteinG.toDouble() }.toInt(),
@@ -836,7 +1006,7 @@ class AetherRepository(context: Context) {
         val day = runCatching { LocalDate.parse(date) }.getOrNull() ?: LocalDate.now()
         if (module == null || module.moduleId == "driving") {
             val phase = examPhase(day, t.examDate)
-            val target = if (phase == ExamPhase.MOCK) 1 else (module?.targetValue ?: t.dailyDriving)
+            val target = if (phase == ExamPhase.MOCK) 1 else t.dailyDriving.coerceAtLeast(1)
             val done = if (phase == ExamPhase.MOCK) db.driving().finishedSessions(date) else db.driving().realtimeAttempts(date)
             val backfill = db.driving().backfillAttempts(date) > 0 && done < target
             val hint = t.examDate?.let { "剩 ${java.time.temporal.ChronoUnit.DAYS.between(day, it)} 天考" } ?: "还没填考试日期"
@@ -845,10 +1015,11 @@ class AetherRepository(context: Context) {
         if (module.moduleId == "english") {
             val done = db.english().count(date)
             val hint = t.travelDate?.let { "剩 ${java.time.temporal.ChronoUnit.DAYS.between(day, it)} 天" } ?: module.subtitle
-            return HardSlice(done >= module.targetValue, false, module.title, done, module.targetValue, module.unit, hint, module.subtitle)
+            return HardSlice(done >= t.dailyEnglish, false, module.title, done, t.dailyEnglish, module.unit, hint, module.subtitle)
         }
-        val met = module.currentValue >= module.targetValue
-        return HardSlice(met, false, module.title, module.currentValue, module.targetValue, module.unit, module.subtitle, module.templateType)
+        val done = if (module.progressDate == date) module.currentValue else 0
+        val met = module.targetValue > 0 && done >= module.targetValue
+        return HardSlice(met, false, module.title, done, module.targetValue, module.unit, module.subtitle, module.templateType)
     }
 
     private suspend fun recompute(date: String, finalize: Boolean) {
@@ -862,7 +1033,8 @@ class AetherRepository(context: Context) {
         val deadline = sleep?.lockDeadline ?: lockTime(day, t).hhmm()
         val sleepOnTime = sleep?.isLateSleep == false
         val violations = db.violations().forDate(date).filter { it.breaksStreak }.map { it.type }
-        val previous = db.streak().previousFinal(date)
+        val previousRow = db.streak().previousFinal(date)
+        val carried = carriedStreak(date, previousRow?.date, previousRow?.status, previousRow?.streakValue ?: 0)
         val decision = decideDay(
             DayInput(
                 weight = Facet(db.weight().realtimeCount(date) > 0, db.weight().backfillCount(date) > 0),
@@ -871,8 +1043,8 @@ class AetherRepository(context: Context) {
                 driving = Facet(drivingRealtime, drivingBackfill),
                 sleepOnTime = sleepOnTime && sleep != null,
                 breakingViolations = violations,
-                previousStatus = previous?.status,
-                previousStreak = previous?.streakValue ?: 0,
+                previousStatus = carried.first,
+                previousStreak = carried.second,
                 backfillCountsAsMet = t.backfillCountsAsMet,
             ),
             finalize,
@@ -911,6 +1083,16 @@ class AetherRepository(context: Context) {
     private suspend fun addViolation(date: String, type: String, detail: String?, breaks: Boolean) {
         if (db.violations().countType(date, type) > 0) return
         db.violations().insert(ViolationRecord(date = date, timestamp = System.currentTimeMillis(), type = type, detail = detail, breaksStreak = breaks))
+    }
+
+    private fun normalizeClock(raw: String?): String? {
+        val clean = raw?.trim()?.replace('：', ':') ?: return null
+        val parts = clean.split(":")
+        if (parts.size != 2) return null
+        val h = parts[0].toIntOrNull() ?: return null
+        val m = parts[1].toIntOrNull() ?: return null
+        if (h !in 0..23 || m !in 0..59) return null
+        return "%02d:%02d".format(h, m)
     }
 
     private suspend fun putRaw(key: String, value: String) {

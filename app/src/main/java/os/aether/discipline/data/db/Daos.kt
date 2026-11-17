@@ -124,7 +124,7 @@ interface StreakDao {
     suspend fun get(date: String): SelfDisciplineStreak?
     @Query("SELECT * FROM self_discipline_streak WHERE date < :date AND status != 'PENDING' ORDER BY date DESC LIMIT 1")
     suspend fun previousFinal(date: String): SelfDisciplineStreak?
-    @Query("SELECT COALESCE(MAX(streakValue), 0) FROM self_discipline_streak WHERE status = 'MET'")
+    @Query("SELECT COALESCE(MAX(streakValue), 0) FROM self_discipline_streak WHERE status IN ('MET', 'BACKFILL_ONLY')")
     suspend fun maxStreak(): Int
     @Query("SELECT * FROM self_discipline_streak ORDER BY date DESC LIMIT 1")
     suspend fun latest(): SelfDisciplineStreak?
@@ -137,6 +137,8 @@ interface ViolationDao {
     suspend fun forDate(date: String): List<ViolationRecord>
     @Query("SELECT COUNT(*) FROM violation_records WHERE date = :date AND type = :type")
     suspend fun countType(date: String, type: String): Int
+    @Query("DELETE FROM violation_records WHERE date = :date AND type = :type")
+    suspend fun deleteType(date: String, type: String)
 }
 
 @Dao
@@ -193,7 +195,7 @@ interface QuoteDao {
 @Dao
 interface EnglishDao {
     @Insert suspend fun insert(row: EnglishLog): Long
-    @Query("SELECT COUNT(*) FROM english_logs WHERE date = :date")
+    @Query("SELECT COUNT(DISTINCT sentence) FROM english_logs WHERE date = :date")
     suspend fun count(date: String): Int
     @Query("SELECT * FROM english_logs WHERE date = :date ORDER BY timestamp ASC")
     suspend fun forDate(date: String): List<EnglishLog>

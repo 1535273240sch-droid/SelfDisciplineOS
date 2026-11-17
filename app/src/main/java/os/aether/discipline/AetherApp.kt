@@ -8,10 +8,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import os.aether.discipline.data.AetherRepository
+import os.aether.discipline.domain.inLockWindow
 import os.aether.discipline.system.AlarmScheduler
-import os.aether.discipline.system.GuardService
+import os.aether.discipline.system.DeviceOwnerCtl
 import os.aether.discipline.system.LockRuntime
 import os.aether.discipline.system.Root
+import java.time.LocalDateTime
 
 class AetherApp : Application() {
     lateinit var repo: AetherRepository
@@ -26,10 +28,33 @@ class AetherApp : Application() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel("aether.lock", "锁屏", NotificationManager.IMPORTANCE_HIGH))
         manager.createNotificationChannel(NotificationChannel("aether.workout", "运动", NotificationManager.IMPORTANCE_LOW))
+        manager.createNotificationChannel(NotificationChannel("aether.emergency", "紧急通行", NotificationManager.IMPORTANCE_LOW))
         scope.launch(Dispatchers.IO) {
             repo.ensureSeed()
+            runCatching { repo.settleMissedDays() }
             primeRoot()
+            runCatching { reconcileLockState() }
             AlarmScheduler.schedule(this@AetherApp)
+        }
+    }
+
+    /** Do not let an old LOCKED/EMERGENCY session leak into daytime after a crash or missed release alarm. */
+    private suspend fun reconcileLockState() {
+        val t = repo.loadThresholds()
+        val now = LocalDateTime.now()
+        val inWindow = inLockWindow(now, t)
+        when {
+            LockRuntime.mode == LockRuntime.EMERGENCY && !LockRuntime.inEmergency() -> {
+                LockRuntime.mode = if (inWindow) LockRuntime.LOCKED else LockRuntime.OFF
+                LockRuntime.persist(this)
+                if (!inWindow) DeviceOwnerCtl.release(this)
+            }
+            LockRuntime.mode == LockRuntime.LOCKED && !inWindow -> {
+                LockRuntime.mode = LockRuntime.OFF
+                LockRuntime.emergencyUntil = 0L
+                LockRuntime.persist(this)
+                DeviceOwnerCtl.release(this)
+            }
         }
     }
 
@@ -38,15 +63,9 @@ class AetherApp : Application() {
         if (prefs.getBoolean("root_primed", false) || !Root.available()) return
         prefs.edit().putBoolean("root_primed", true).apply()
         Root.exec("dumpsys deviceidle whitelist +$packageName")
-        val component = "$packageName/${GuardService::class.java.name}"
-        val current = Root.exec("settings get secure enabled_accessibility_services").second
-        val merged = buildList {
-            current.split(":").map { it.trim() }.filter { it.isNotBlank() && it != "null" }.forEach { add(it) }
-            if (component !in this) add(component)
-        }.joinToString(":")
-        Root.exec("settings put secure enabled_accessibility_services $merged")
-        Root.exec("settings put secure accessibility_enabled 1")
+        Root.enableAccessibility(this)
         Root.exec("appops set $packageName SYSTEM_ALERT_WINDOW allow")
-        os.aether.discipline.system.DeviceOwnerCtl.tryPath1(this)
+        // Device Owner is deliberately NOT set here: it is irreversible without a factory reset.
+        // The user must trigger it explicitly from the Root settings screen.
     }
 }

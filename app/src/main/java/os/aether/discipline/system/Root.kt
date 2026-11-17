@@ -35,6 +35,21 @@ object Root {
     } catch (t: Throwable) {
         false to (t.message ?: "su 失败")
     }
+
+    /** Enable this app's accessibility service without dropping the user's other services. */
+    fun enableAccessibility(context: Context): Pair<Boolean, String> {
+        val component = "${context.packageName}/${GuardService::class.java.name}"
+        val current = exec("settings get secure enabled_accessibility_services").second
+        val merged = buildList {
+            current.split(":").map { it.trim() }
+                .filter { it.isNotBlank() && it != "null" }
+                .forEach { add(it) }
+            if (component !in this) add(component)
+        }.joinToString(":")
+        val services = exec("settings put secure enabled_accessibility_services $merged")
+        val enabled = exec("settings put secure accessibility_enabled 1")
+        return (services.first && enabled.first) to (services.second + "\n" + enabled.second).trim()
+    }
 }
 
 object LockRuntime {
@@ -72,16 +87,19 @@ object DeviceOwnerCtl {
 
     fun isOwner(context: Context) = runCatching { dpm(context).isDeviceOwnerApp(context.packageName) }.getOrDefault(false)
 
-    fun apply(context: Context, emergencyPackages: Array<String>) {
+    fun apply(context: Context, emergencyPackages: Array<String>, emergency: Boolean = false) {
         if (!isOwner(context)) return
         val admin = component(context)
         val dpm = dpm(context)
-        runCatching { dpm.setStatusBarDisabled(admin, !LockRuntime.inEmergency()) }
+        runCatching { dpm.setStatusBarDisabled(admin, !emergency) }
         runCatching { dpm.setKeyguardDisabled(admin, true) }
-        runCatching { dpm.setCameraDisabled(admin, !LockRuntime.inEmergency()) }
+        runCatching { dpm.setCameraDisabled(admin, !emergency) }
         runCatching {
             dpm.setLockTaskPackages(admin, emergencyPackages)
-            dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE)
+            dpm.setLockTaskFeatures(
+                admin,
+                if (emergency) DevicePolicyManager.LOCK_TASK_FEATURE_HOME else DevicePolicyManager.LOCK_TASK_FEATURE_NONE,
+            )
         }
     }
 
@@ -93,6 +111,7 @@ object DeviceOwnerCtl {
         runCatching { dpm.setKeyguardDisabled(admin, false) }
         runCatching { dpm.setCameraDisabled(admin, false) }
         runCatching { dpm.setLockTaskPackages(admin, arrayOf(context.packageName)) }
+        runCatching { dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE) }
     }
 
     fun clear(context: Context): String {

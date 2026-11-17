@@ -2,6 +2,7 @@ package os.aether.discipline.domain
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.LocalDate
@@ -134,5 +135,54 @@ class RulesTest {
     fun speechScore() {
         assertTrue(similarity("The gate closes at noon", "the gate closes at noon") >= 95)
         assertTrue(similarity("The gate closes at noon", "gate closes") < 90)
+    }
+
+    @Test
+    fun crossMidnightLockWindowStillWorks() {
+        val cross = Thresholds(
+            weekdayLock = LocalTime.of(23, 0),
+            weekendLock = LocalTime.of(23, 0),
+            weekdayWake = LocalTime.of(8, 0),
+            weekendWake = LocalTime.of(9, 0),
+        )
+        assertTrue(inLockWindow(LocalDateTime.of(2026, 11, 16, 23, 1), cross))
+        assertTrue(inLockWindow(LocalDateTime.of(2026, 11, 17, 3, 0), cross))
+        assertFalse(inLockWindow(LocalDateTime.of(2026, 11, 17, 8, 31), cross))
+        assertFalse(inLockWindow(LocalDateTime.of(2026, 11, 17, 22, 59), cross))
+        // Friday night releases on the weekend schedule (09:30).
+        assertTrue(inLockWindow(LocalDateTime.of(2026, 11, 21, 9, 0), cross))
+        assertFalse(inLockWindow(LocalDateTime.of(2026, 11, 21, 9, 31), cross))
+    }
+
+    @Test
+    fun streakDoesNotContinueAfterAGap() {
+        val continuous = carriedStreak("2026-11-17", "2026-11-16", "MET", 3)
+        assertEquals("MET", continuous.first)
+        assertEquals(3, continuous.second)
+
+        val gap = carriedStreak("2026-11-17", "2026-11-14", "MET", 3)
+        assertNull(gap.first)
+        assertEquals(0, gap.second)
+    }
+
+    @Test
+    fun dietIgnoresWaterAndNegation() {
+        assertNull(parseDiet("我喝了一杯水", 12))
+        assertNull(parseDiet("今天不吃饭", 12))
+        assertEquals("SNACK", parseDiet("晚上吃夜宵", 21)?.mealType)
+    }
+
+    @Test
+    fun mealTypeFollowsHour() {
+        assertEquals("BREAKFAST", mealTypeFor(8))
+        assertEquals("LUNCH", mealTypeFor(12))
+        assertEquals("DINNER", mealTypeFor(18))
+        assertEquals("SNACK", mealTypeFor(22))
+    }
+
+    @Test
+    fun malformedStoredClockDoesNotCrash() {
+        assertEquals(0, nightAxis("11pm"))
+        assertEquals(0, nightAxis("23：00：00"))
     }
 }

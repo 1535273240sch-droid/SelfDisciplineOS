@@ -54,20 +54,37 @@ fun nextLock(now: LocalDateTime, t: Thresholds): LocalDateTime {
     return LocalDateTime.of(tomorrow, lockTime(tomorrow, t))
 }
 
+/** Full window for the lock that starts on [date]. Handles lock times later than the release time. */
+fun lockWindow(date: LocalDate, t: Thresholds): Pair<LocalDateTime, LocalDateTime> {
+    val start = LocalDateTime.of(date, lockTime(date, t))
+    val sameDayRelease = LocalDateTime.of(date, releaseTime(date, t))
+    val end = if (sameDayRelease.isBefore(start)) {
+        // The window crosses midnight; the release belongs to the next day (and may use the weekend schedule).
+        LocalDateTime.of(date.plusDays(1), releaseTime(date.plusDays(1), t))
+    } else {
+        sameDayRelease
+    }
+    return start to end
+}
+
 fun inLockWindow(now: LocalDateTime, t: Thresholds): Boolean {
     val date = now.toLocalDate()
-    val start = LocalDateTime.of(date, lockTime(date, t))
-    val end = LocalDateTime.of(date, releaseTime(date, t))
-    return !now.isBefore(start) && now.isBefore(end)
+    // Check the window that starts today and the one that started yesterday (cross-midnight case).
+    return listOf(date.minusDays(1), date).any { day ->
+        val (start, end) = lockWindow(day, t)
+        !now.isBefore(start) && now.isBefore(end)
+    }
 }
 
 fun untilLock(now: LocalDateTime, t: Thresholds): Duration = Duration.between(now, nextLock(now, t))
 
 /** Minutes on a night axis: evening is negative, after midnight is positive. */
 fun nightAxis(hhmm: String): Int {
-    val parts = hhmm.split(":")
-    val h = parts[0].toInt()
-    val m = parts.getOrElse(1) { "0" }.toInt()
+    val parts = hhmm.trim().replace('：', ':').split(":")
+    if (parts.size !in 1..2) return 0
+    val h = parts.getOrNull(0)?.toIntOrNull() ?: return 0
+    val m = parts.getOrNull(1)?.toIntOrNull() ?: 0
+    if (h !in 0..23 || m !in 0..59) return 0
     val mins = h * 60 + m
     return if (h >= 12) mins - 24 * 60 else mins
 }
@@ -132,9 +149,10 @@ fun decideDay(input: DayInput, finalize: Boolean): DayDecision {
         !finalize -> "PENDING"
         else -> {
             val facets = listOf(input.weight, input.diet, input.sleep, input.driving)
-            val anyMissing = facets.any { !it.realtime && !it.backfill } || !input.sleep.realtime && !input.sleep.backfill
+            val anyMissing = facets.any { !it.realtime && !it.backfill }
             val touchedBackfill = facets.any { it.backfill }
-            if (touchedBackfill && !anyMissing && input.sleepOnTime) "BACKFILL_ONLY" else "BROKEN"
+            // Backfilled days are neutral: they keep the records but never move the streak.
+            if (touchedBackfill && !anyMissing) "BACKFILL_ONLY" else "BROKEN"
         }
     }
     return DayDecision(status, nextStreak(input.previousStatus, input.previousStreak, status), status == "MET")
@@ -148,6 +166,18 @@ fun nextStreak(previousStatus: String?, previousValue: Int, status: String): Int
         "BROKEN" -> 0
         else -> carried
     }
+}
+
+/** A streak only continues from the immediately preceding calendar day. Missing days reset it. */
+fun carriedStreak(
+    date: String,
+    previousDate: String?,
+    previousStatus: String?,
+    previousValue: Int,
+): Pair<String?, Int> {
+    val day = runCatching { LocalDate.parse(date) }.getOrNull() ?: return null to 0
+    val prev = previousDate?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+    return if (prev == day.minusDays(1)) previousStatus to previousValue else null to 0
 }
 
 data class QuestionRef(
@@ -306,19 +336,26 @@ private fun normalizeSleepHour(hour: Int, text: String): Int {
     }
 }
 
+fun mealTypeFor(hour: Int): String = when {
+    hour < 10 -> "BREAKFAST"
+    hour < 15 -> "LUNCH"
+    hour < 21 -> "DINNER"
+    else -> "SNACK"
+}
+
 fun parseDiet(text: String, hour: Int): DietDraft? {
-    val foodCue = listOf("吃", "喝", "蛋", "咖啡", "饭", "餐", "奶", "肉", "菜", "面", "粥")
-    if (foodCue.none { text.contains(it) }) return null
-    if (text.contains("题") && foodCue.none { it != "吃" && text.contains(it) } && !text.contains("吃")) return null
+    val foodCues = listOf("吃", "蛋", "饭", "餐", "奶", "肉", "菜", "面", "粥", "咖啡", "零食", "夜宵", "加餐")
+    if (foodCues.none { text.contains(it) } && !text.contains("喝")) return null
+    // Do not turn "没吃饭 / 不喝了" into a realtime meal record.
+    if (Regex("(没|不|别|少)\\s*(吃|喝)").containsMatchIn(text)) return null
+    // Plain water / medicine is not a meal.
+    if (text.contains("喝") && foodCues.none { text.contains(it) }) return null
     val meal = when {
-        text.contains("早") || text.contains("早餐") || text.contains("早饭") -> "BREAKFAST"
-        text.contains("午") || text.contains("午饭") || text.contains("午餐") -> "LUNCH"
-        text.contains("晚") || text.contains("晚饭") || text.contains("晚餐") -> "DINNER"
         text.contains("夜宵") || text.contains("零食") || text.contains("加餐") -> "SNACK"
-        hour < 10 -> "BREAKFAST"
-        hour < 15 -> "LUNCH"
-        hour < 21 -> "DINNER"
-        else -> "SNACK"
+        text.contains("早") -> "BREAKFAST"
+        text.contains("午") -> "LUNCH"
+        text.contains("晚") -> "DINNER"
+        else -> mealTypeFor(hour)
     }
     return DietDraft(meal, text.trim())
 }

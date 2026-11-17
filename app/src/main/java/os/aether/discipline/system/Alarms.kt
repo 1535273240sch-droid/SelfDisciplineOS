@@ -32,11 +32,25 @@ object AlarmScheduler {
     const val CHIME = "os.aether.discipline.CHIME"
     const val WATCHDOG = "os.aether.discipline.WATCHDOG"
     const val RELOCK = "os.aether.discipline.RELOCK"
+    const val SETTLE = "os.aether.discipline.SETTLE"
 
     fun schedule(app: AetherApp) {
         app.scope.launch {
             val now = LocalDateTime.now()
             val t = app.repo.loadThresholds()
+            // Self-heal a stale session even if the RELEASE alarm or the app process died.
+            when {
+                LockRuntime.mode == LockRuntime.EMERGENCY && !LockRuntime.inEmergency() -> {
+                    LockRuntime.mode = if (inLockWindow(now, t)) LockRuntime.LOCKED else LockRuntime.OFF
+                    LockRuntime.persist(app)
+                }
+                LockRuntime.mode == LockRuntime.LOCKED && !inLockWindow(now, t) -> {
+                    LockRuntime.mode = LockRuntime.OFF
+                    LockRuntime.emergencyUntil = 0L
+                    LockRuntime.persist(app)
+                    DeviceOwnerCtl.release(app)
+                }
+            }
             val zone = ZoneId.systemDefault()
             fun at(time: LocalDateTime) = time.atZone(zone).toInstant().toEpochMilli()
             fun next(timeOf: (LocalDate) -> LocalTime): LocalDateTime {
@@ -49,26 +63,39 @@ object AlarmScheduler {
             setActivity(app, LockActivity::class.java, at(nextLock(now, t)), 10)
             setActivity(app, BriefingActivity::class.java, at(next { wakeTime(it, t) }), 11)
             set(app, PREP, at(next { prepTime(it, t) }), 12)
-            set(app, RELEASE, at(next { releaseTime(it, t) }), 13)
+            set(app, RELEASE, at(next { releaseTime(it, t) }), 13, alarmClock = true)
             val reviewBase = nextLock(now, t).minusMinutes(20)
             val review = if (reviewBase.isAfter(now)) reviewBase else nextLock(nextLock(now, t).plusMinutes(1), t).minusMinutes(20)
             set(app, REVIEW, at(review), 14)
             set(app, BACKUP, at(next { LocalTime.of(3, 30) }), 15)
+            // Day close is independent of the (configurable) lock time.
+            set(app, SETTLE, at(next { LocalTime.of(0, 5) }), 19)
             nextChime(now, t.weekendSilentUntil)?.let { set(app, CHIME, at(it), 16) }
             if (inLockWindow(now, t) && LockRuntime.mode == LockRuntime.LOCKED) {
-                setActivity(app, LockActivity::class.java, System.currentTimeMillis() + 5 * 60_000L, 17)
+                // Between wake time and the 30-minute release fallback the briefing owns the screen;
+                // a watchdog would otherwise replace the morning briefing with the lock UI.
+                val nowTime = now.toLocalTime()
+                val briefingGrace = !nowTime.isBefore(wakeTime(now.toLocalDate(), t)) &&
+                    nowTime.isBefore(releaseTime(now.toLocalDate(), t))
+                if (!briefingGrace) {
+                    setActivity(app, LockActivity::class.java, System.currentTimeMillis() + 5 * 60_000L, 17)
+                }
             }
         }
     }
 
-    fun set(context: Context, action: String, trigger: Long, request: Int) {
+    fun set(context: Context, action: String, trigger: Long, request: Int, alarmClock: Boolean = false) {
         if (trigger <= System.currentTimeMillis()) return
         val am = context.getSystemService(AlarmManager::class.java)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val op = PendingIntent.getBroadcast(context, request, Intent(context, AlarmReceiver::class.java).setAction(action), flags)
-        val show = PendingIntent.getActivity(context, request + 100, Intent(context, LockActivity::class.java), flags)
         try {
-            am.setAlarmClock(AlarmManager.AlarmClockInfo(trigger, show), op)
+            if (alarmClock) {
+                val show = PendingIntent.getActivity(context, request + 100, Intent(context, LockActivity::class.java), flags)
+                am.setAlarmClock(AlarmManager.AlarmClockInfo(trigger, show), op)
+            } else {
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, op)
+            }
         } catch (_: SecurityException) {
             openExactAlarm(context)
         }
@@ -109,6 +136,10 @@ class AlarmReceiver : BroadcastReceiver() {
         val app = context.applicationContext as AetherApp
         app.scope.launch {
             try {
+                runCatching {
+                    app.repo.ensureSeed()
+                    app.repo.settleMissedDays()
+                }
                 when (intent.action) {
                     AlarmScheduler.PREP -> app.repo.refreshBriefing()
                     AlarmScheduler.LOCK -> openLock(context, false)
@@ -117,12 +148,21 @@ class AlarmReceiver : BroadcastReceiver() {
                     AlarmScheduler.CHIME -> chimeIfIdle(context)
                     AlarmScheduler.REVIEW -> review(app)
                     AlarmScheduler.BACKUP -> app.repo.backupNow()
+                    AlarmScheduler.SETTLE -> Unit // settleMissedDays() already ran above
                     AlarmScheduler.WATCHDOG -> if (LockRuntime.mode == LockRuntime.LOCKED) openLock(context, false)
                     AlarmScheduler.RELOCK -> {
-                        LockRuntime.mode = LockRuntime.LOCKED
-                        LockRuntime.persist(context)
                         app.repo.revokeEmergency()
-                        openLock(context, false)
+                        context.stopService(Intent(context, EmergencyService::class.java))
+                        if (inLockWindow(LocalDateTime.now(), app.repo.loadThresholds())) {
+                            LockRuntime.mode = LockRuntime.LOCKED
+                            LockRuntime.persist(context)
+                            openLock(context, false)
+                        } else {
+                            LockRuntime.mode = LockRuntime.OFF
+                            LockRuntime.emergencyUntil = 0L
+                            LockRuntime.persist(context)
+                            DeviceOwnerCtl.release(context)
+                        }
                     }
                 }
             } finally {
@@ -147,6 +187,7 @@ class AlarmReceiver : BroadcastReceiver() {
     private fun release(context: Context) {
         LockRuntime.mode = LockRuntime.OFF
         LockRuntime.persist(context)
+        context.stopService(Intent(context, EmergencyService::class.java))
         DeviceOwnerCtl.release(context)
         context.startActivity(Intent(context, LockActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("release", true))
     }
@@ -186,12 +227,20 @@ class BootReceiver : BroadcastReceiver() {
                         LockRuntime.mode = LockRuntime.LOCKED
                         LockRuntime.persist(context)
                         context.startActivity(Intent(context, LockActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    } else if (DeviceOwnerCtl.isOwner(context)) {
+                    } else {
+                        // A boot outside the window must not keep an old LOCKED/EMERGENCY session alive.
+                        LockRuntime.mode = LockRuntime.OFF
+                        LockRuntime.emergencyUntil = 0L
+                        LockRuntime.persist(context)
                         DeviceOwnerCtl.release(context)
                     }
                 }
                 if (Root.available()) {
                     Root.exec("dumpsys deviceidle whitelist +${context.packageName}")
+                }
+                runCatching {
+                    app.repo.ensureSeed()
+                    app.repo.settleMissedDays()
                 }
             } finally {
                 AlarmScheduler.schedule(app)

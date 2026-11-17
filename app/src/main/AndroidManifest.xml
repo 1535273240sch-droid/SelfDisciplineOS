@@ -59,7 +59,7 @@
         <activity
             android:name=".system.LockActivity"
             android:excludeFromRecents="true"
-            android:exported="true"
+            android:exported="false"
             android:launchMode="singleTask"
             android:showWhenLocked="true"
             android:theme="@style/Theme.Aether.Lock"
@@ -67,7 +67,7 @@
 
         <activity
             android:name=".system.BriefingActivity"
-            android:exported="true"
+            android:exported="false"
             android:launchMode="singleTask"
             android:showWhenLocked="true"
             android:theme="@style/Theme.Aether.Lock"
@@ -157,6 +157,15 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="discipline_lock_monitor" />
+        </service>
+
+        <service
+            android:name=".system.EmergencyService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="discipline_emergency_countdown" />
         </service>
 
         <provider

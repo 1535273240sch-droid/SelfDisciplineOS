@@ -1,6 +1,7 @@
 package os.aether.discipline.ui
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaPlayer
@@ -44,6 +45,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -58,6 +60,7 @@ import os.aether.discipline.domain.parseUtterance
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.time.LocalTime
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -74,6 +77,7 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
     var warn by remember { mutableStateOf(false) }
     var holding by remember { mutableStateOf(false) }
     var sample by remember { mutableStateOf(false) }
+    val submitted = remember { AtomicBoolean(false) }
     val scale by animateFloatAsState(if (holding) 1.08f else 1f, aetherSpring(), label = "mic")
     val recorder = remember {
         WavHold(File(context.cacheDir, "voice/hold.wav")) { value ->
@@ -97,8 +101,10 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
         delay(5_000)
         if (holding) {
             holding = false
-            val file = recorder.stop()
-            scope.launch { submit(repo, tts, file, null) { typing = it } }
+            if (submitted.compareAndSet(false, true)) {
+                val file = recorder.stop()
+                scope.launch { submit(repo, tts, file, null) { typing = it } }
+            }
         }
     }
     Column(modifier.fillMaxWidth().background(colors.surface).padding(16.dp)) {
@@ -157,14 +163,20 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
                     .background(colors.accent.copy(alpha = 0.85f + level.coerceIn(0f, 1f) * 0.15f))
                     .pointerInput(Unit) {
                         detectTapGestures(onPress = {
-                            mic.launch(Manifest.permission.RECORD_AUDIO)
-                            holding = true
-                            warn = false
-                            recorder.start()
-                            tryAwaitRelease()
-                            holding = false
-                            val file = recorder.stop()
-                            submit(repo, tts, file, null) { typing = it }
+                            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                                mic.launch(Manifest.permission.RECORD_AUDIO)
+                            } else {
+                                holding = true
+                                warn = false
+                                submitted.set(false)
+                                recorder.start()
+                                tryAwaitRelease()
+                                holding = false
+                                if (submitted.compareAndSet(false, true)) {
+                                    val file = recorder.stop()
+                                    submit(repo, tts, file, null) { typing = it }
+                                }
+                            }
                         })
                     },
             )
@@ -190,7 +202,7 @@ private suspend fun submit(
         return
     }
     repo.saveMessage("USER", heard)
-    val local = parseUtterance(heard)
+    val local = parseUtterance(heard, LocalTime.now().hour)
     val fast = repo.bound("fast") ?: repo.bound("companion")
     val toolNames = mutableSetOf<String>()
     var widget: String? = null
@@ -205,7 +217,7 @@ private suspend fun submit(
         }
     }
     if ("record_weight" !in toolNames) local.weight?.let { repo.recordWeight(it.kg, it.fasting, if (fast == null) "VOICE_LOCAL_FALLBACK" else "VOICE") }
-    if ("record_sleep" !in toolNames) local.sleep?.let { repo.recordSleep(it.sleepHHmm, it.wakeHHmm, fast == null) }
+    if ("record_sleep" !in toolNames) local.sleep?.let { repo.recordSleep(it.sleepHHmm, it.wakeHHmm) }
     if ("record_diet" !in toolNames) local.diet?.let { repo.recordDiet(it.mealType, it.description, 0, 0f, 0f, 0f, needsBackfill = true) }
     if ("record_calisthenics" !in toolNames) local.calisthenics?.let { repo.recordCalisthenics(it.category, it.step, it.sets, it.reps) }
     val companion = repo.bound("companion")
@@ -256,26 +268,32 @@ private class WavHold(private val file: File, private val onLevel: (Float) -> Un
         thread = Thread {
             val rate = 16000
             val min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(2048)
-            val audio = AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, min * 2)
-            audio.startRecording()
-            val pcm = java.io.ByteArrayOutputStream()
-            val buffer = ByteArray(min)
-            while (running.get()) {
-                val n = audio.read(buffer, 0, buffer.size)
-                if (n > 0) {
-                    pcm.write(buffer, 0, n)
-                    var sum = 0.0
-                    for (i in 0 until n step 2) {
-                        if (i + 1 >= n) break
-                        val sample = (buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xff)
-                        sum += sample * sample
+            val audio = runCatching {
+                AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, min * 2)
+            }.getOrNull()
+            if (audio != null) {
+                runCatching { audio.startRecording() }
+                val pcm = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(min)
+                while (running.get()) {
+                    val n = audio.read(buffer, 0, buffer.size)
+                    if (n > 0) {
+                        pcm.write(buffer, 0, n)
+                        var sum = 0.0
+                        for (i in 0 until n step 2) {
+                            if (i + 1 >= n) break
+                            val sample = (buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xff)
+                            sum += sample * sample
+                        }
+                        onLevel((kotlin.math.sqrt(sum / (n / 2)) / 8000.0).toFloat().coerceIn(0f, 1f))
                     }
-                    onLevel((kotlin.math.sqrt(sum / (n / 2)) / 8000.0).toFloat().coerceIn(0f, 1f))
                 }
+                runCatching { audio.stop() }
+                runCatching { audio.release() }
+                runCatching { writeWav(file, pcm.toByteArray(), rate) }
+            } else {
+                running.set(false)
             }
-            audio.stop()
-            audio.release()
-            writeWav(file, pcm.toByteArray(), rate)
         }.also { it.start() }
     }
 

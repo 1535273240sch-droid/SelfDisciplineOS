@@ -38,8 +38,10 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import os.aether.discipline.data.AetherRepository
 import os.aether.discipline.data.TodayUi
+import os.aether.discipline.domain.mealTypeFor
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.time.LocalTime
 
 @Composable
 fun BentoToday(repo: AetherRepository, nav: NavHostController) {
@@ -80,7 +82,7 @@ fun BentoToday(repo: AetherRepository, nav: NavHostController) {
                     Quiet("今日硬指标")
                     Quiet(today.hardHint)
                 }
-                Metric("${today.drivingDone} / ${today.drivingTarget} ${if (today.hardTitle.contains("英语")) "句" else "题"}", size = 22)
+                Metric("${today.drivingDone} / ${today.drivingTarget} ${today.hardUnit}", size = 22)
                 Box(Modifier.fillMaxWidth().padding(top = 8.dp).height(6.dp).clip(RoundedCornerShape(99.dp)).background(colors.textSecondary.copy(alpha = 0.15f))) {
                     Box(Modifier.fillMaxWidth(bar).height(6.dp).background(colors.accent))
                 }
@@ -172,10 +174,27 @@ private suspend fun readVision(repo: AetherRepository, file: File, kind: String)
 }
 
 private suspend fun saveVision(repo: AetherRepository, text: String, kind: String) {
-    val json = runCatching { JSONObject(text.substringAfter("{").let { "{" + it.substringBeforeLast("}") + "}" }) }.getOrNull() ?: return
+    val json = parseVisionJson(text) ?: return
     if (kind == "scale") {
         if (!json.isNull("kg")) repo.recordWeight(json.optDouble("kg").toFloat(), true, "SCALE_OCR")
     } else {
-        repo.recordDiet("LUNCH", json.optString("items"), json.optInt("calories"), json.optDouble("protein_g").toFloat(), json.optDouble("carbs_g").toFloat(), json.optDouble("fat_g").toFloat(), needsBackfill = json.optInt("calories") == 0)
+        val items = json.optString("items").trim()
+        if (items.isBlank()) return
+        repo.recordDiet(
+            mealTypeFor(LocalTime.now().hour),
+            items,
+            json.optInt("calories"),
+            json.optDouble("protein_g").toFloat(),
+            json.optDouble("carbs_g").toFloat(),
+            json.optDouble("fat_g").toFloat(),
+            needsBackfill = json.optInt("calories") == 0,
+        )
     }
+}
+
+private fun parseVisionJson(text: String): JSONObject? {
+    val start = text.indexOf('{')
+    val end = text.lastIndexOf('}')
+    if (start < 0 || end <= start) return null
+    return runCatching { JSONObject(text.substring(start, end + 1)) }.getOrNull()
 }
