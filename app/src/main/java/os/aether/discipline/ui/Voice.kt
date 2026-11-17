@@ -62,7 +62,7 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
-fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit) {
+fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: () -> Unit) {
     val colors = LocalAether.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -101,7 +101,7 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit) {
             scope.launch { submit(repo, tts, file, null) { typing = it } }
         }
     }
-    Column(Modifier.fillMaxSize().background(colors.background).padding(16.dp)) {
+    Column(modifier.fillMaxWidth().background(colors.surface).padding(16.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Quiet("搭档")
             Text("关闭", color = colors.accent, modifier = Modifier.padding(8.dp).clip(CircleShape).background(colors.surface).padding(8.dp).pointerInput(Unit) { detectTapGestures { onClose() } })

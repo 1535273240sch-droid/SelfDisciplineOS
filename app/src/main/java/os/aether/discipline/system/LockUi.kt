@@ -8,22 +8,29 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -31,6 +38,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import os.aether.discipline.ui.aetherSpring
 import os.aether.discipline.AetherApp
 import os.aether.discipline.domain.AlwaysLockPackages
 import os.aether.discipline.domain.isWeekend
@@ -113,7 +121,7 @@ class LockActivity : ComponentActivity() {
                         } else {
                             AccentButton("紧急工作解锁") { asking = true }
                         }
-                        AccentButton("今晚放弃", {
+                        GiveUpHold {
                             scope.launch {
                                 app.repo.giveUp()
                                 LockRuntime.mode = LockRuntime.GIVEN_UP
@@ -121,7 +129,7 @@ class LockActivity : ComponentActivity() {
                                 LockRuntime.persist(this@LockActivity)
                                 releaseAndFinish()
                             }
-                        })
+                        }
                         if (message.isNotBlank()) Quiet(message)
                     }
                 }
@@ -216,5 +224,36 @@ class BriefingActivity : ComponentActivity() {
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         getSharedPreferences("aether", MODE_PRIVATE).edit().putString("briefing_touch", LocalDate.now().toString()).apply()
         return super.dispatchTouchEvent(ev)
+    }
+}
+
+@Composable
+private fun GiveUpHold(onConfirm: () -> Unit) {
+    var pressing by remember { mutableStateOf(false) }
+    var progress by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(pressing) {
+        if (!pressing) {
+            progress = 0f
+            return@LaunchedEffect
+        }
+        val started = System.currentTimeMillis()
+        while (pressing && progress < 1f) {
+            progress = ((System.currentTimeMillis() - started) / 2000f).coerceIn(0f, 1f)
+            delay(16)
+        }
+        if (progress >= 1f) onConfirm()
+    }
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().pointerInput(Unit) {
+        detectTapGestures(onPress = {
+            pressing = true
+            tryAwaitRelease()
+            pressing = false
+        })
+    }) {
+        Canvas(Modifier.size(36.dp)) {
+            drawArc(androidx.compose.ui.graphics.Color(0xFF3F3F46), 0f, 360f, false, style = androidx.compose.ui.graphics.drawscope.Stroke(3.dp.toPx()))
+            drawArc(androidx.compose.ui.graphics.Color(0xFF7F1D1D), -90f, 360f * progress, false, style = androidx.compose.ui.graphics.drawscope.Stroke(3.dp.toPx()))
+        }
+        Text(if (pressing) "继续按住，松手会取消" else "长按 2 秒确认今晚放弃", color = androidx.compose.ui.graphics.Color(0xFF7F1D1D), fontSize = 12.sp)
     }
 }

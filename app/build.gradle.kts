@@ -14,8 +14,8 @@ android {
         applicationId = "os.aether.discipline"
         minSdk = 30
         targetSdk = 36
-        versionCode = 2
-        versionName = "2.0.0"
+        versionCode = 3
+        versionName = "2.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
@@ -88,6 +88,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.10.1")
     implementation("com.google.android.gms:play-services-location:21.3.0")
     implementation("com.github.topjohnwu.libsu:core:6.0.0")
+    implementation("dev.chrisbanes.haze:haze:1.6.10")
+    implementation("androidx.glance:glance-appwidget:1.1.1")
+    implementation("androidx.glance:glance-material3:1.1.1")
 
     testImplementation("junit:junit:4.13.2")
 }

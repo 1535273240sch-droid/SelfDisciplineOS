@@ -169,6 +169,28 @@ interface BriefingDao {
 }
 
 @Dao
+interface LearningDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsert(row: CustomLearningModule)
+    @Query("SELECT * FROM custom_learning_modules ORDER BY sortOrder ASC")
+    suspend fun ordered(): List<CustomLearningModule>
+    @Query("SELECT * FROM custom_learning_modules WHERE moduleId = :id")
+    suspend fun get(id: String): CustomLearningModule?
+    @Query("UPDATE custom_learning_modules SET countsTowardsStreak = 0")
+    suspend fun clearHardFlags()
+}
+
+@Dao
+interface QuoteDao {
+    @Insert suspend fun insert(row: FinanceQuote): Long
+    @Query("SELECT COUNT(*) FROM finance_quotes")
+    suspend fun count(): Int
+    @Query("SELECT * FROM finance_quotes ORDER BY id ASC")
+    suspend fun all(): List<FinanceQuote>
+    @Query("SELECT * FROM finance_quotes WHERE id = :id")
+    suspend fun get(id: Long): FinanceQuote?
+}
+
+@Dao
 interface EnglishDao {
     @Insert suspend fun insert(row: EnglishLog): Long
     @Query("SELECT COUNT(*) FROM english_logs WHERE date = :date")

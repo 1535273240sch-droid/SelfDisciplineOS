@@ -21,6 +21,7 @@ import os.aether.discipline.data.db.AiMemoryProfile
 import os.aether.discipline.data.db.AiProviderConfig
 import os.aether.discipline.data.db.AppDatabase
 import os.aether.discipline.data.db.Briefing
+import os.aether.discipline.data.db.CustomLearningModule
 import os.aether.discipline.data.db.CalisthenicsLog
 import os.aether.discipline.data.db.CalisthenicsProgress
 import os.aether.discipline.data.db.DietRecord
@@ -29,6 +30,7 @@ import os.aether.discipline.data.db.DrivingExamPlan
 import os.aether.discipline.data.db.DrivingQuestion
 import os.aether.discipline.data.db.DrivingSession
 import os.aether.discipline.data.db.EnglishLog
+import os.aether.discipline.data.db.FinanceQuote
 import os.aether.discipline.data.db.SelfDisciplineStreak
 import os.aether.discipline.data.db.SleepRecord
 import os.aether.discipline.data.db.UnlockEvent
@@ -50,12 +52,15 @@ import os.aether.discipline.domain.inLockWindow
 import os.aether.discipline.domain.isLateSleep
 import os.aether.discipline.domain.lockTime
 import os.aether.discipline.domain.minutesLate
+import os.aether.discipline.domain.nextLock
 import os.aether.discipline.domain.paceLabel
 import os.aether.discipline.domain.parseUtterance
 import os.aether.discipline.domain.pruneBackups
 import os.aether.discipline.domain.sleepConclusion
 import os.aether.discipline.domain.untilLock
 import os.aether.discipline.domain.wakeTime
+import os.aether.discipline.news.CryptoBoard
+import os.aether.discipline.news.CryptoMarket
 import os.aether.discipline.news.NewsFetcher
 import java.io.File
 import java.security.MessageDigest
@@ -96,9 +101,34 @@ data class TodayUi(
     val examText: String = "还没填考试日期",
     val travelText: String = "还没填出发日期",
     val brokenReason: String = "",
+    val countdownClock: String = "--:--",
+    val lockCaption: String = "今晚锁定",
+    val guardText: String = "正常守卫中",
+    val hardTitle: String = "今日硬指标",
+    val hardHint: String = "",
+    val hardDetail: String = "",
+    val weightValue: String = "—",
+    val deltaText: String = "",
+    val deltaDown: Boolean = true,
+    val englishScene: String = "",
+    val fitnessName: String = "还未开始",
+    val fitnessGate: String = "",
+    val briefingHead: List<String> = emptyList(),
+    val briefingRest: List<String> = emptyList(),
 )
 
 data class Bound(val provider: AiProviderConfig, val model: String, val key: String, val path: String)
+
+private data class HardSlice(
+    val met: Boolean,
+    val backfill: Boolean,
+    val title: String,
+    val done: Int,
+    val target: Int,
+    val unit: String,
+    val hint: String,
+    val detail: String,
+)
 
 data class EmergencyResult(val ok: Boolean, val message: String, val until: Long = 0)
 
@@ -131,9 +161,95 @@ class AetherRepository(context: Context) {
             }
         }
         syncPlan()
+        if (db.learning().ordered().isEmpty()) {
+            listOf(
+                CustomLearningModule("crypto", "加密货币行情与情报追踪", "直连 Gate.io 现货 + AI 降噪快讯", "CRYPTO_TRACKER", 1, 0, "次", false, false, 0),
+                CustomLearningModule("driving", "驾考（科一/科四）每日百题", "前 10 天刷题，后 4 天模考", "DAILY_QUOTA", 100, 0, "题", true, false, 1),
+                CustomLearningModule("english", "美国自由行场景英语", "1.0x / 0.75x 美式跟读", "DAILY_QUOTA", 5, 0, "句", false, false, 2),
+                CustomLearningModule("fitness", "囚徒健身与户外", "六式晋级 + GPS 跑步散步", "DAILY_QUOTA", 1, 0, "次", false, false, 3),
+            ).forEach { db.learning().upsert(it) }
+        }
+        if (db.quotes().count() == 0) {
+            listOf(
+                FinanceQuote(quoteText = "市场永远不会错，错的只有人的主观臆断与不止损的侥幸。", bookTitle = "股票大作手回忆录", author = "杰西·利弗莫尔"),
+                FinanceQuote(quoteText = "交易的本质不是预测未来，而是在概率优势出现时严格执行风控。", bookTitle = "交易心理分析", author = "马克·道格拉斯"),
+                FinanceQuote(quoteText = "在别人贪婪时恐惧，在别人恐惧时保持冷静与现金流。", bookTitle = "聪明的投资者", author = "本杰明·格雷厄姆"),
+                FinanceQuote(quoteText = "不要把没有经过尾部风险检验的脆弱仓位暴露在黑天鹅之下。", bookTitle = "反脆弱", author = "纳西姆·塔勒布"),
+                FinanceQuote(quoteText = "原则是把决策写成可以反复执行的规则，而不是每次重新靠感觉。", bookTitle = "原则", author = "瑞·达利欧"),
+            ).forEach { db.quotes().insert(it) }
+        }
     }
 
     suspend fun today(): TodayUi = withContext(Dispatchers.IO) { buildToday() }
+
+    suspend fun modules(): List<CustomLearningModule> = db.learning().ordered()
+
+    suspend fun moveModule(id: String, direction: Int) {
+        val rows = db.learning().ordered().toMutableList()
+        val index = rows.indexOfFirst { it.moduleId == id }
+        val target = index + direction
+        if (index < 0 || target !in rows.indices) return
+        val a = rows[index]
+        val b = rows[target]
+        db.learning().upsert(a.copy(sortOrder = b.sortOrder))
+        db.learning().upsert(b.copy(sortOrder = a.sortOrder))
+    }
+
+    suspend fun setHardModule(id: String) {
+        db.learning().clearHardFlags()
+        db.learning().get(id)?.let { db.learning().upsert(it.copy(countsTowardsStreak = true)) }
+        recompute(todayString(), false)
+    }
+
+    suspend fun setArchived(id: String, archived: Boolean) {
+        db.learning().get(id)?.let { db.learning().upsert(it.copy(isArchived = archived)) }
+    }
+
+    suspend fun addModule(title: String, target: Int, template: String): String {
+        val id = "custom_${System.currentTimeMillis()}"
+        val order = (db.learning().ordered().maxOfOrNull { it.sortOrder } ?: 0) + 1
+        db.learning().upsert(
+            CustomLearningModule(
+                moduleId = id,
+                title = title.ifBlank { "新的学习模块" },
+                subtitle = "自定义阶段学习 · 支持一句话累加",
+                templateType = template,
+                targetValue = target.coerceAtLeast(1),
+                currentValue = 0,
+                unit = if (template == "COUNTDOWN_SPRINT") "天" else "次",
+                countsTowardsStreak = false,
+                sortOrder = order,
+            ),
+        )
+        return id
+    }
+
+    suspend fun bumpModule(id: String, amount: Int) {
+        val row = db.learning().get(id) ?: return
+        db.learning().upsert(row.copy(currentValue = (row.currentValue + amount).coerceAtMost(row.targetValue.coerceAtLeast(1))))
+        recompute(todayString(), false)
+    }
+
+    suspend fun markCryptoReviewed() {
+        val row = db.learning().get("crypto") ?: return
+        db.learning().upsert(row.copy(currentValue = row.targetValue.coerceAtLeast(1)))
+        recompute(todayString(), false)
+    }
+
+    suspend fun quotes(): List<FinanceQuote> = db.quotes().all()
+
+    suspend fun addQuote(text: String, book: String, author: String) {
+        if (text.isBlank()) return
+        db.quotes().insert(FinanceQuote(quoteText = text.trim(), bookTitle = book.ifBlank { "个人摘录" }, author = author.ifBlank { "自己" }, isCustom = true))
+    }
+
+    suspend fun quoteAt(index: Int): FinanceQuote? {
+        val all = db.quotes().all()
+        if (all.isEmpty()) return null
+        return all[Math.floorMod(index, all.size)]
+    }
+
+    suspend fun refreshCrypto(): CryptoBoard = CryptoMarket.load()
 
     suspend fun saveThreshold(key: String, value: String) = withContext(Dispatchers.IO) {
         val existing = db.thresholds().get(key) ?: return@withContext
@@ -632,11 +748,10 @@ class AetherRepository(context: Context) {
         val sleep = db.sleep().get(key)
         val diets = db.diet().forDate(key)
         val phase = examPhase(date, t.examDate)
-        val attempts = db.driving().realtimeAttempts(key)
-        val mocks = db.driving().finishedSessions(key)
-        val drivingTarget = if (phase == ExamPhase.MOCK) 1 else t.dailyDriving
-        val drivingDone = if (phase == ExamPhase.MOCK) mocks else attempts
-        val drivingMet = drivingDone >= drivingTarget
+        val hardNow = hardProgress(key, t)
+        val drivingTarget = hardNow.target
+        val drivingDone = hardNow.done
+        val drivingMet = hardNow.met
         val weightOk = db.weight().realtimeCount(key) > 0
         val dietOk = diets.any { !it.isBackfill }
         val sleepOk = sleep != null && !sleep.isBackfill
@@ -654,17 +769,30 @@ class AetherRepository(context: Context) {
             if (diff > 0) "↑${"%.1f".format(diff)}" else "↓${"%.1f".format(-diff)}"
         } else ""
         val briefing = db.briefings().get(key)
+        val briefLines = briefing?.body?.lines()?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+        val push = db.calisthenics().get("PUSHUP")
+        val pushGate = push?.let { stepOf("PUSHUP", it.currentStep) }
         val steps = db.calisthenics().all().joinToString("  ") { "${categoryLabel(it.moveCategory)} ${it.currentStep}式" }
+        val scene = phrases().let { all -> all[Math.floorMod(key.hashCode(), all.size)].scene }
         val reasons = db.violations().forDate(key).map { violationLabel(it.type) }.distinct()
         val locked = inLockWindow(now, t)
         val remain = untilLock(now, t)
+        val hours = remain.toHours()
+        val mins = remain.toMinutes() % 60
+        val next = nextLock(now, t)
         return TodayUi(
             date = key,
             weekday = weekdayLabel(date),
             streak = displayStreak,
             maxStreak = db.streak().maxStreak(),
             status = streakRow?.status ?: "PENDING",
-            countdown = if (locked) "锁屏中" else "${remain.toHours()}小时${remain.toMinutes() % 60}分",
+            countdown = if (locked) "锁屏中" else "${hours}小时${mins}分",
+            countdownClock = if (locked) "00:00" else "%02d:%02d".format(hours, mins),
+            lockCaption = if (next.hour == 1) "今晚 01:00 锁定" else "今晚 00:00 锁定",
+            guardText = if (locked) "锁屏守卫中" else "正常守卫中",
+            hardTitle = hardNow.title,
+            hardHint = hardNow.hint,
+            hardDetail = hardNow.detail,
             inLock = locked,
             sleepText = sleepConclusion(sleep?.actualSleepTime, sleep?.lockDeadline ?: lockTime(date, t).hhmm(), !t.excludePrivacy),
             sleepOk = sleepPass,
@@ -673,7 +801,13 @@ class AetherRepository(context: Context) {
             drivingMet = drivingMet,
             phase = phase.name,
             weightText = latest?.let { "${it.weightKg} kg" } ?: "未记录",
+            weightValue = latest?.let { "%.1f".format(it.weightKg) } ?: "—",
             weightDelta = delta,
+            deltaText = if (latest != null && previous != null) {
+                val diff = latest.weightKg - previous.weightKg
+                "${if (diff > 0) "+" else ""}${"%.1f".format(diff)} kg"
+            } else "还没有对照",
+            deltaDown = latest == null || previous == null || latest.weightKg <= previous.weightKg,
             calories = diets.sumOf { it.calories },
             calorieLimit = t.calorieLimit,
             protein = diets.sumOf { it.proteinG.toDouble() }.toInt(),
@@ -685,19 +819,45 @@ class AetherRepository(context: Context) {
             englishTarget = t.dailyEnglish,
             briefing = briefing?.body ?: "今天的早报还没生成。",
             briefingMiss = briefing?.unreachableCount ?: 0,
+            briefingHead = briefLines.take(2),
+            briefingRest = briefLines.drop(2),
             steps = steps,
+            englishScene = scene,
+            fitnessName = push?.let { "俯卧撑 第${it.currentStep}式" } ?: "俯卧撑",
+            fitnessGate = pushGate?.let { "升级目标：${it.upSets}组 × ${it.upReps}次" } ?: "",
             examText = t.examDate?.let { "距考试 ${java.time.temporal.ChronoUnit.DAYS.between(date, it)} 天" } ?: "还没填考试日期",
             travelText = t.travelDate?.let { "距出发 ${java.time.temporal.ChronoUnit.DAYS.between(date, it)} 天" } ?: "还没填出发日期",
             brokenReason = reasons.joinToString("、"),
         )
     }
 
+    private suspend fun hardProgress(date: String, t: Thresholds): HardSlice {
+        val module = db.learning().ordered().firstOrNull { it.countsTowardsStreak && !it.isArchived }
+        val day = runCatching { LocalDate.parse(date) }.getOrNull() ?: LocalDate.now()
+        if (module == null || module.moduleId == "driving") {
+            val phase = examPhase(day, t.examDate)
+            val target = if (phase == ExamPhase.MOCK) 1 else (module?.targetValue ?: t.dailyDriving)
+            val done = if (phase == ExamPhase.MOCK) db.driving().finishedSessions(date) else db.driving().realtimeAttempts(date)
+            val backfill = db.driving().backfillAttempts(date) > 0 && done < target
+            val hint = t.examDate?.let { "剩 ${java.time.temporal.ChronoUnit.DAYS.between(day, it)} 天考" } ?: "还没填考试日期"
+            return HardSlice(done >= target, backfill, module?.title ?: "驾考每日百题", done, target, "题", hint, if (phase == ExamPhase.MOCK) "全真模考" else "高频 70% + 错题 30%")
+        }
+        if (module.moduleId == "english") {
+            val done = db.english().count(date)
+            val hint = t.travelDate?.let { "剩 ${java.time.temporal.ChronoUnit.DAYS.between(day, it)} 天" } ?: module.subtitle
+            return HardSlice(done >= module.targetValue, false, module.title, done, module.targetValue, module.unit, hint, module.subtitle)
+        }
+        val met = module.currentValue >= module.targetValue
+        return HardSlice(met, false, module.title, module.currentValue, module.targetValue, module.unit, module.subtitle, module.templateType)
+    }
+
     private suspend fun recompute(date: String, finalize: Boolean) {
         val t = loadThresholds()
         val day = LocalDate.parse(date)
         val phase = examPhase(day, t.examDate)
-        val drivingRealtime = if (phase == ExamPhase.MOCK) db.driving().finishedSessions(date) > 0 else db.driving().realtimeAttempts(date) >= t.dailyDriving
-        val drivingBackfill = db.driving().backfillAttempts(date) > 0
+        val hardNow = hardProgress(date, t)
+        val drivingRealtime = hardNow.met
+        val drivingBackfill = hardNow.backfill
         val sleep = db.sleep().get(date)
         val deadline = sleep?.lockDeadline ?: lockTime(day, t).hhmm()
         val sleepOnTime = sleep?.isLateSleep == false
@@ -725,6 +885,7 @@ class AetherRepository(context: Context) {
                 sleepRecorded = sleep != null && !sleep.isBackfill,
                 sleepOnTime = sleepOnTime && sleep != null,
                 drivingTargetMet = drivingRealtime,
+                hardStudyTargetMet = drivingRealtime,
                 allThreeHardMet = decision.allThreeHardMet,
                 streakValue = decision.streakValue,
                 status = decision.status,

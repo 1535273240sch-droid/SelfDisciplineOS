@@ -26,8 +26,11 @@ import androidx.room.RoomDatabase
         UserThreshold::class,
         Briefing::class,
         EnglishLog::class,
+        CustomLearningModule::class,
+        FinanceQuote::class,
+        DesktopWidgetConfig::class,
     ],
-    version = 1,
+    version = 2,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -44,6 +47,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun thresholds(): ThresholdDao
     abstract fun briefings(): BriefingDao
     abstract fun english(): EnglishDao
+    abstract fun learning(): LearningDao
+    abstract fun quotes(): QuoteDao
 
     companion object {
         @Volatile private var instance: AppDatabase? = null

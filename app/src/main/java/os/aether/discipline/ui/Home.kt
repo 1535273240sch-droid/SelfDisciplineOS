@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -36,6 +37,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asComposeRenderEffect
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
@@ -71,13 +75,20 @@ class MainActivity : ComponentActivity() {
         setContent {
             val theme by this@MainActivity.uiStore.data.map { it[themeKey] ?: "frost" }.collectAsStateWithLifecycle(initialValue = "frost")
             var voice by remember { mutableStateOf(false) }
+            val scale by androidx.compose.animation.core.animateFloatAsState(if (voice) 0.95f else 1f, aetherSpring(), label = "sheet")
             AetherTheme(theme) {
                 val nav = rememberNavController()
                 Box(Modifier.fillMaxSize()) {
-                    Column(Modifier.fillMaxSize()) {
+                    Column(Modifier.fillMaxSize().graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                        if (voice && android.os.Build.VERSION.SDK_INT >= 31) {
+                            renderEffect = android.graphics.RenderEffect.createBlurEffect(16f, 16f, android.graphics.Shader.TileMode.CLAMP).asComposeRenderEffect()
+                        }
+                    }) {
                         NavHost(nav, startDestination = "today", modifier = Modifier.weight(1f)) {
-                            composable("today") { Dashboard(repo, nav) }
-                            composable("lab") { Lab(repo, nav) }
+                            composable("today") { BentoToday(repo, nav) }
+                            composable("lab") { StudyScreen(repo, nav) }
                             composable("settings") { Settings(nav) }
                             composable("driving") { DrivingScreen(repo) }
                             composable("english") { EnglishScreen(repo) }
@@ -87,12 +98,62 @@ class MainActivity : ComponentActivity() {
                             composable("providers") { ProviderScreen(repo) }
                             composable("root") { RootScreen(repo) }
                         }
-                        if (!voice) Bar(nav) { voice = true }
                     }
-                    if (voice) VoiceLayer(repo) { voice = false }
+                    if (!voice) {
+                        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
+                            FloatingDock(nav) { voice = true }
+                        }
+                    }
+                    if (voice) {
+                        VoiceLayer(
+                            repo,
+                            Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.74f),
+                        ) { voice = false }
+                    }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit) {
+    val colors = LocalAether.current
+    val current = nav.currentBackStackEntryAsState().value?.destination?.route
+    Box(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 20.dp, end = 20.dp, bottom = 16.dp)) {
+        DockSurface(Modifier.fillMaxWidth().height(58.dp)) {
+            Row(Modifier.fillMaxSize().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                DockItem("今日", "today", current, nav, Modifier.weight(1f))
+                DockItem("学习", "lab", current, nav, Modifier.weight(1f))
+                Spacer(Modifier.size(64.dp))
+                DockItem("设置", "settings", current, nav, Modifier.weight(1f))
+                DockItem("锁屏", "lock", current, nav, Modifier.weight(1f))
+            }
+        }
+        Box(
+            Modifier.align(Alignment.TopCenter).offset(y = (-18).dp).size(64.dp).clip(CircleShape).clickable(onClick = onVoice),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(Modifier.size(64.dp)) {
+                drawCircle(androidx.compose.ui.graphics.Brush.radialGradient(listOf(androidx.compose.ui.graphics.Color.White, colors.accent)))
+                drawCircle(colors.accent, radius = 11.dp.toPx())
+            }
+        }
+    }
+}
+
+@Composable
+private fun DockItem(label: String, route: String, current: String?, nav: NavHostController, modifier: Modifier) {
+    val context = LocalContext.current
+    val colors = LocalAether.current
+    Box(modifier.clickable {
+        if (route == "lock") {
+            context.startActivity(android.content.Intent(context, os.aether.discipline.system.LockActivity::class.java))
+        } else {
+            nav.navigate(route) { launchSingleTop = true; popUpTo("today") }
+        }
+    }, contentAlignment = Alignment.Center) {
+        Text(label, color = if (current == route) colors.accent else colors.textSecondary, fontSize = 12.sp)
     }
 }
 
@@ -213,7 +274,7 @@ private fun CalorieRing(eaten: Int, limit: Int) {
     val ratio = if (limit <= 0) 0f else (eaten / limit.toFloat()).coerceIn(0f, 1f)
     Box(contentAlignment = Alignment.Center) {
         Canvas(Modifier.size(92.dp)) {
-            drawArc(colors.border, 0f, 360f, false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
+            drawArc(colors.rimBottom, 0f, 360f, false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
             drawArc(colors.accent, -90f, 360f * ratio, false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
         }
         Quiet(if (limit <= 0) "$eaten" else "$eaten/$limit")
@@ -288,14 +349,28 @@ private fun Settings(nav: NavHostController) {
     val scope = rememberCoroutineScope()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Quiet("偏好")
-        listOf("frost" to "银白磨砂", "titanium" to "钛金属", "parchment" to "羊皮纸", "midnight" to "午夜").forEach { (id, label) ->
+        listOf("frost" to "银白磨砂", "nebula" to "星云紫", "sunset" to "落日橙", "parchment" to "羊皮纸", "titanium" to "钛金属", "midnight" to "午夜").forEach { (id, label) ->
             GlassCard(Modifier.clickable {
                 scope.launch { context.uiStore.edit { it[themeKey] = id } }
             }) { Body(label) }
         }
+        GlassCard {
+            Body("万能桌面小组件")
+            Quiet("磨砂卡片，直接唤起系统钉选。")
+            AccentButton("双拼 4×2") { pinWidget(context, os.aether.discipline.widget.ComboWidgetReceiver::class.java) }
+            AccentButton("行情 2×2") { pinWidget(context, os.aether.discipline.widget.CryptoWidgetReceiver::class.java) }
+            AccentButton("金句 4×2") { pinWidget(context, os.aether.discipline.widget.QuoteWidgetReceiver::class.java) }
+        }
         GlassCard(Modifier.clickable { nav.navigate("providers") }) { Body("模型路由") }
         GlassCard(Modifier.clickable { nav.navigate("thresholds") }) { Body("数据与阈值") }
         GlassCard(Modifier.clickable { nav.navigate("root") }) { Body("Root 与锁屏") }
-        Quiet("云端朗读会把回复文本再发一次。题库导入在 Root 页旁边的阈值页，不提供导出。")
+        Quiet("云端朗读会把回复文本再发一次。题库导入在驾考页，不提供导出。")
+    }
+}
+
+private fun pinWidget(context: android.content.Context, receiver: Class<*>) {
+    val manager = android.appwidget.AppWidgetManager.getInstance(context)
+    if (android.os.Build.VERSION.SDK_INT >= 26 && manager.isRequestPinAppWidgetSupported) {
+        manager.requestPinAppWidget(android.content.ComponentName(context, receiver), null, null)
     }
 }

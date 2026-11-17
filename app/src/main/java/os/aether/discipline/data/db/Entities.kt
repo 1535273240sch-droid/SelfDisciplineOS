@@ -172,6 +172,7 @@ data class SelfDisciplineStreak(
     val sleepRecorded: Boolean = false,
     val sleepOnTime: Boolean = false,
     val drivingTargetMet: Boolean = false,
+    val hardStudyTargetMet: Boolean = false,
     val allThreeHardMet: Boolean = false,
     val streakValue: Int = 0,
     val status: String,
@@ -215,6 +216,38 @@ data class Briefing(
     val body: String,
     val unreachableCount: Int,
     val headlineCount: Int,
+)
+
+@Entity(tableName = "custom_learning_modules")
+data class CustomLearningModule(
+    @PrimaryKey val moduleId: String,
+    val title: String,
+    val subtitle: String,
+    val templateType: String,
+    val targetValue: Int,
+    val currentValue: Int,
+    val unit: String,
+    val countsTowardsStreak: Boolean,
+    val isArchived: Boolean = false,
+    val sortOrder: Int,
+)
+
+@Entity(tableName = "finance_quotes")
+data class FinanceQuote(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val quoteText: String,
+    val bookTitle: String,
+    val author: String,
+    val isCustom: Boolean = false,
+)
+
+@Entity(tableName = "desktop_widget_configs")
+data class DesktopWidgetConfig(
+    @PrimaryKey val widgetId: Int,
+    val widgetType: String,
+    val cryptoSymbolsJson: String,
+    val showStreak: Boolean = true,
+    val currentQuoteId: Long,
 )
 
 @Entity(tableName = "english_logs")
