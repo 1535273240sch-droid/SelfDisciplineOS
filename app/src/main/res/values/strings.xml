@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Aether</string>
+    <string name="accessibility_desc">锁屏时段如果遮罩离开前台，把 Aether 拉回来。只在你自己打开的锁屏里工作。</string>
+</resources>

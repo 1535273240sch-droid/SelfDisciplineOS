@@ -1,0 +1,393 @@
+package os.aether.discipline.ui
+
+import android.Manifest
+import android.content.Intent
+import android.os.Environment
+import android.speech.tts.TextToSpeech
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import os.aether.discipline.content.categoryLabel
+import os.aether.discipline.content.stepOf
+import os.aether.discipline.data.AetherRepository
+import os.aether.discipline.data.db.DrivingQuestion
+import os.aether.discipline.domain.SyllabusGaps
+import os.aether.discipline.domain.paceLabel
+import os.aether.discipline.domain.similarity
+import os.aether.discipline.domain.wordDiff
+import os.aether.discipline.system.DeviceOwnerCtl
+import os.aether.discipline.system.LocationService
+import os.aether.discipline.system.Root
+import os.aether.discipline.system.accessibilityOn
+import os.aether.discipline.system.exactAlarmAllowed
+import os.aether.discipline.system.openAllFiles
+import os.aether.discipline.system.openBattery
+import os.aether.discipline.system.openExactAlarm
+import os.aether.discipline.system.openOverlay
+import os.aether.discipline.system.openUsage
+import os.aether.discipline.system.usageAllowed
+import java.util.Locale
+
+@Composable
+fun DrivingScreen(repo: AetherRepository) {
+    val scope = rememberCoroutineScope()
+    var subject by remember { mutableIntStateOf(1) }
+    var mock by remember { mutableStateOf(false) }
+    var questions by remember { mutableStateOf<List<DrivingQuestion>>(emptyList()) }
+    var index by remember { mutableIntStateOf(0) }
+    var picked by remember { mutableStateOf("") }
+    var correct by remember { mutableIntStateOf(0) }
+    var explain by remember { mutableStateOf("") }
+    var done by remember { mutableStateOf(false) }
+    var left by remember { mutableIntStateOf(45 * 60) }
+    var note by remember { mutableStateOf("") }
+    LaunchedEffect(mock, questions.size) {
+        if (!mock || questions.isEmpty()) return@LaunchedEffect
+        while (left > 0 && !done) {
+            delay(1000)
+            left -= 1
+        }
+        if (left == 0) done = true
+    }
+    LaunchedEffect(done) {
+        if (done && mock && questions.isNotEmpty()) repo.finishMock(subject, questions.size, correct)
+    }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Quiet("驾考 · 内置题按公开的 163/172 号令口径，不是商业题库")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AccentButton(if (subject == 1) "科一 ·" else "科一") { subject = 1 }
+            AccentButton(if (subject == 4) "科四 ·" else "科四") { subject = 4 }
+            AccentButton(if (mock) "模考中" else "模考") { mock = !mock; left = if (subject == 4) 30 * 60 else 45 * 60 }
+        }
+        AccentButton("开始") {
+            scope.launch {
+                questions = repo.paper(subject, mock)
+                index = 0
+                correct = 0
+                done = false
+                explain = ""
+                note = if (questions.size > repo.db.driving().count()) "题库少于 100，今日会循环。" else ""
+            }
+        }
+        if (mock && questions.isNotEmpty()) Quiet("剩余 ${left / 60}:${"%02d".format(left % 60)}")
+        if (note.isNotBlank()) Quiet(note)
+        val question = questions.getOrNull(index)
+        if (question == null && questions.isNotEmpty() || done) {
+            Body(if (questions.isEmpty()) "题库还是空的" else "这组 ${correct}/${questions.size}")
+        }
+        if (question != null && !done) {
+            GlassCard {
+                Body(question.content)
+                optionsOf(question.optionsJson).forEach { option ->
+                    val key = optionKey(option)
+                    Text(option, color = if (picked == key) LocalAether.current.accent else LocalAether.current.textPrimary, modifier = Modifier.padding(vertical = 6.dp).clickable { picked = key })
+                }
+                AccentButton("确认") {
+                    scope.launch {
+                        val ok = repo.answer(question, setOf(picked), if (mock) "MOCK" else "DAILY")
+                        if (ok) correct += 1 else explain = question.officialExplanation
+                        picked = ""
+                        if (index + 1 >= questions.size) done = true else index += 1
+                    }
+                }
+                if (explain.isNotBlank()) {
+                    Quiet(explain)
+                    AccentButton("AI 拆解") {
+                        scope.launch {
+                            val bound = repo.bound("companion")
+                            explain = if (bound == null) question.officialExplanation else {
+                                val messages = JSONArray().put(JSONObject().put("role", "user").put("content", "只解释这道已有题目，不要出新题。用大白话讲扣分逻辑，再给一句顺口溜。\n${question.content}\n${question.optionsJson}\n答案 ${question.correctAnswer}\n${question.officialExplanation}"))
+                                repo.ai.chat(bound.provider.baseUrl, bound.key, bound.model, messages, temperature = 0.4).content.ifBlank { question.officialExplanation }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Quiet("大纲待补")
+        SyllabusGaps.forEach { Quiet("· $it") }
+        val context = LocalContext.current
+        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            val text = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }.orEmpty()
+            scope.launch { note = "导入 ${repo.importQuestions(text)} 题" }
+        }
+        AccentButton("导入题库文件") { picker.launch(arrayOf("application/json", "text/plain", "*/*")) }
+    }
+}
+
+@Composable
+fun EnglishScreen(repo: AetherRepository) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val tts = remember { TextToSpeech(context, null) }
+    DisposableEffect(Unit) { onDispose { tts.shutdown() } }
+    var rate by remember { mutableStateOf(1f) }
+    var index by remember { mutableIntStateOf(0) }
+    var score by remember { mutableStateOf("") }
+    val daily = remember { repo.dailyPhrases() }
+    val phrase = daily[index % daily.size]
+    val mic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Quiet(phrase.scene)
+        Metric(phrase.english)
+        Body(phrase.chinese)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AccentButton("1.0x") { rate = 1f }
+            AccentButton("0.75x") { rate = 0.75f }
+            AccentButton("听") {
+                tts.language = Locale.US
+                tts.setSpeechRate(rate)
+                tts.speak(phrase.english, TextToSpeech.QUEUE_FLUSH, null, phrase.id)
+            }
+        }
+        AccentButton("先允许麦克风") { mic.launch(Manifest.permission.RECORD_AUDIO) }
+        Quiet("按住底部语音键读这一句，再回来评分。评分只比较转写和原句。")
+        AccentButton("用刚才的录音评分") {
+            scope.launch {
+                val bound = repo.bound("transcribe")
+                val file = java.io.File(context.cacheDir, "voice/hold.wav")
+                if (bound == null || !file.exists()) {
+                    score = "先绑定转写，并在语音页按住读完这一句"
+                    return@launch
+                }
+                val heard = runCatching { repo.ai.transcribe(bound.provider.baseUrl, bound.key, bound.path, bound.model, file) }.getOrDefault("")
+                val value = similarity(phrase.english, heard)
+                score = "$value  $heard\n${wordDiff(phrase.english, heard)}"
+                repo.logEnglish(phrase.scene, phrase.english, value)
+                if (index + 1 < daily.size) index += 1
+            }
+        }
+        if (score.isNotBlank()) Quiet(score)
+        Quiet("今日 ${index}/${daily.size}")
+    }
+}
+
+@Composable
+fun WorkoutScreen() {
+    val context = LocalContext.current
+    val live by os.aether.discipline.system.WorkoutBus.state.collectAsStateWithLifecycle()
+    val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted[Manifest.permission.ACCESS_FINE_LOCATION] == true) startWorkout(context, "RUN")
+    }
+    Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Quiet(if (live.type == "WALK") "散步" else "跑步")
+        Metric(if (live.meters <= 0f) "0.00" else "%.2f".format(live.meters / 1000f))
+        Quiet("公里 · ${paceLabel(live.meters, live.seconds)} · ${live.seconds / 60}分 · 步频 ${live.cadence}")
+        val colors = LocalAether.current
+        Canvas(Modifier.fillMaxWidth().height(220.dp)) {
+            if (live.points.size < 2) return@Canvas
+            val lats = live.points.map { it.first }
+            val lngs = live.points.map { it.second }
+            val minLat = lats.min(); val maxLat = lats.max(); val minLng = lngs.min(); val maxLng = lngs.max()
+            fun x(lng: Double) = ((lng - minLng) / ((maxLng - minLng).takeIf { it > 0 } ?: 1.0) * size.width).toFloat()
+            fun y(lat: Double) = ((maxLat - lat) / ((maxLat - minLat).takeIf { it > 0 } ?: 1.0) * size.height).toFloat()
+            val path = Path()
+            live.points.forEachIndexed { i, p -> if (i == 0) path.moveTo(x(p.second), y(p.first)) else path.lineTo(x(p.second), y(p.first)) }
+            drawPath(path, colors.accent, style = Stroke(4.dp.toPx()))
+            drawCircle(colors.accent, 6f, Offset(x(live.points.last().second), y(live.points.last().first)))
+        }
+        if (live.message.isNotBlank()) Quiet(live.message)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AccentButton("跑") { permission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACTIVITY_RECOGNITION, Manifest.permission.POST_NOTIFICATIONS)) }
+            AccentButton("走") {
+                ContextCompat.startForegroundService(context, Intent(context, LocationService::class.java).putExtra("type", "WALK"))
+            }
+            AccentButton("结束") {
+                context.startService(Intent(context, LocationService::class.java).putExtra("stop", true))
+            }
+        }
+        Quiet("轨迹只留在手机上，不会放进 AI 的提示词。")
+    }
+}
+
+private fun startWorkout(context: android.content.Context, type: String) {
+    ContextCompat.startForegroundService(context, Intent(context, LocationService::class.java).putExtra("type", type))
+}
+
+@Composable
+fun CalisthenicsScreen(repo: AetherRepository) {
+    val scope = rememberCoroutineScope()
+    var rows by remember { mutableStateOf(emptyList<os.aether.discipline.data.db.CalisthenicsProgress>()) }
+    var sets by remember { mutableStateOf("2") }
+    var reps by remember { mutableStateOf("10") }
+    var note by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { rows = repo.db.calisthenics().all() }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Quiet("囚徒健身 · 语音也可以直接说「第五式俯卧撑 2 组 20 个」")
+        rows.forEach { row ->
+            val gate = stepOf(row.moveCategory, row.currentStep)
+            GlassCard {
+                Body("${categoryLabel(row.moveCategory)} · 第 ${row.currentStep} 式 ${row.currentStepName}")
+                Quiet("初级 ${gate.beginnerSets}×${gate.beginnerReps}  中级 ${gate.midSets}×${gate.midReps}  升级 ${gate.upSets}×${gate.upReps}")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(sets, { sets = it }, label = { Text("组") }, modifier = Modifier.weight(1f))
+                    OutlinedTextField(reps, { reps = it }, label = { Text("次") }, modifier = Modifier.weight(1f))
+                }
+                AccentButton("记下") {
+                    scope.launch {
+                        note = repo.recordCalisthenics(row.moveCategory, row.currentStep, sets.toIntOrNull() ?: 1, reps.toIntOrNull() ?: 0)
+                        rows = repo.db.calisthenics().all()
+                    }
+                }
+            }
+        }
+        if (note.isNotBlank()) Quiet(note)
+    }
+}
+
+@Composable
+fun ThresholdScreen(repo: AetherRepository) {
+    val rows by repo.thresholdRows.collectAsStateWithLifecycle(emptyList())
+    val scope = rememberCoroutineScope()
+    var pin by remember { mutableStateOf("") }
+    var pinNote by remember { mutableStateOf("") }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Quiet("改完立即影响仪表盘和判定")
+        OutlinedTextField(pin, { if (it.length <= 6) pin = it.filter(Char::isDigit) }, label = { Text("6 位紧急密码") })
+        AccentButton("保存密码") { scope.launch { pinNote = repo.setPin(pin) } }
+        if (pinNote.isNotBlank()) Quiet(pinNote)
+        rows.filter { it.key !in setOf("emergency_password_hash", "emergency_password_salt", "lock_strength") && !it.key.startsWith("scene_") }
+            .forEach { row ->
+                var value by remember(row.key, row.updatedAt) { mutableStateOf(row.value) }
+                OutlinedTextField(value, { value = it }, label = { Text(row.label + (row.unit?.let { u -> " ($u)" } ?: "")) }, modifier = Modifier.fillMaxWidth())
+                AccentButton("保存") { scope.launch { repo.saveThreshold(row.key, value) } }
+            }
+    }
+}
+
+@Composable
+fun ProviderScreen(repo: AetherRepository) {
+    val providers by repo.providers.collectAsStateWithLifecycle(emptyList())
+    val scope = rememberCoroutineScope()
+    var name by remember { mutableStateOf("") }
+    var base by remember { mutableStateOf("https://api.deepseek.com/v1") }
+    var key by remember { mutableStateOf("") }
+    var path by remember { mutableStateOf("/audio/transcriptions") }
+    var note by remember { mutableStateOf("") }
+    var models by remember { mutableStateOf(emptyList<String>()) }
+    var providerId by remember { mutableStateOf(0L) }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Quiet("Key 只加密存在这台手机里，不会进源码。")
+        OutlinedTextField(name, { name = it }, label = { Text("渠道名") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(base, { base = it }, label = { Text("Base URL") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(key, { key = it }, label = { Text("API Key") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(path, { path = it }, label = { Text("转写路径覆盖") }, modifier = Modifier.fillMaxWidth())
+        AccentButton("添加") {
+            scope.launch {
+                if (name.isBlank() || base.isBlank() || key.isBlank()) return@launch
+                providerId = repo.addProvider(name, base, key, path)
+                key = ""
+                note = "已保存"
+            }
+        }
+        providers.forEach { provider ->
+            GlassCard {
+                Body(provider.providerName)
+                Quiet(provider.baseUrl)
+                Quiet("转写 ${provider.transcriptionPath}")
+                AccentButton("拉取模型") {
+                    scope.launch {
+                        val secret = os.aether.discipline.ai.KeystoreCrypto.decrypt(provider.apiKeyEncrypted)
+                        models = runCatching { repo.ai.listModels(provider.baseUrl, secret) }.getOrElse { listOf(it.message ?: "失败") }
+                        providerId = provider.id
+                        repo.cacheModels(provider.id, models.filter { !it.contains("失败") && !it.contains("HTTP") })
+                        note = "拉到 ${models.size} 个"
+                    }
+                }
+                AccentButton("删除") { scope.launch { repo.deleteProvider(provider.id) } }
+            }
+        }
+        var chosen by remember { mutableStateOf("") }
+        if (models.isNotEmpty() && providerId != 0L) {
+            Quiet("点一个模型，再点要绑的场景")
+            models.take(30).forEach { model ->
+                Text(model, color = if (chosen == model) LocalAether.current.accent else LocalAether.current.textPrimary, modifier = Modifier.clickable { chosen = model }.padding(vertical = 4.dp))
+            }
+            listOf("companion" to "搭档", "fast" to "速记", "transcribe" to "转写", "vision" to "视觉", "briefing" to "早报", "tts" to "云端音色").forEach { (scene, label) ->
+                AccentButton("绑到$label") { scope.launch { if (chosen.isNotBlank()) { repo.bind(scene, providerId, chosen); note = "$label 使用 $chosen" } } }
+            }
+        }
+        if (note.isNotBlank()) Quiet(note)
+    }
+}
+
+@Composable
+fun RootScreen(repo: AetherRepository) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var log by remember { mutableStateOf("") }
+    var risk by remember { mutableStateOf("") }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val owner = DeviceOwnerCtl.isOwner(context)
+        Body(if (owner) "当前强度：Device Owner 真拦" else "当前强度：降级，遮罩加记账")
+        Quiet("su ${if (Root.available()) "可用" else "不可用"}")
+        Quiet("精确闹钟 ${if (exactAlarmAllowed(context)) "已授权" else "未授权"}")
+        Quiet("使用情况 ${if (usageAllowed(context)) "已授权" else "未授权"}")
+        Quiet("无障碍 ${if (accessibilityOn(context)) "已启用" else "未启用"}")
+        Quiet("悬浮窗 ${if (android.provider.Settings.canDrawOverlays(context)) "已授权" else "未授权"}")
+        Quiet("全部文件 ${if (Environment.isExternalStorageManager()) "已授权" else "未授权"}")
+        AccentButton("精确闹钟") { openExactAlarm(context) }
+        AccentButton("使用情况") { openUsage(context) }
+        AccentButton("悬浮窗") { openOverlay(context) }
+        AccentButton("全部文件") { openAllFiles(context) }
+        AccentButton("电池优化") { openBattery(context) }
+        AccentButton("Root 修复：白名单 + 无障碍") {
+            scope.launch {
+                val cmp = "${context.packageName}/os.aether.discipline.system.GuardService"
+                log = Root.exec("dumpsys deviceidle whitelist +${context.packageName}").second + "\n" +
+                    Root.exec("settings put secure enabled_accessibility_services $cmp").second
+            }
+        }
+        AccentButton("尝试 Device Owner 路径 1") { scope.launch { log = DeviceOwnerCtl.tryPath1(context) } }
+        OutlinedTextField(risk, { risk = it }, label = { Text("输入「确认风险」才允许路径 2") })
+        AccentButton("路径 2：备份后写系统文件") {
+            if (risk == "确认风险") scope.launch { log = DeviceOwnerCtl.tryPath2(context) } else log = "先输入确认风险"
+        }
+        AccentButton("重启使路径 2 生效") { if (risk == "确认风险") Root.exec("reboot") }
+        AccentButton("解除设备管理员") { scope.launch { log = DeviceOwnerCtl.clear(context) } }
+        AccentButton("立刻做一份快照") { scope.launch { log = repo.backupNow() } }
+        if (log.isNotBlank()) Quiet(log.take(800))
+        Quiet("路径 2 写错可能导致只能恢复出厂。备份在 Download/DSH-Go/backup。")
+    }
+}
+
+private fun optionsOf(json: String): List<String> = runCatching {
+    val array = JSONArray(json)
+    List(array.length()) { array.getString(it) }
+}.getOrDefault(emptyList())
+
+private fun optionKey(option: String): String = Regex("^([A-D])\\.").find(option)?.groupValues?.get(1) ?: option

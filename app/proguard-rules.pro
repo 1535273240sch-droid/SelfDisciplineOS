@@ -1,0 +1,6 @@
+-keepattributes *Annotation*,InnerClasses,Signature,EnclosingMethod
+-keep class os.aether.discipline.data.db.** { *; }
+-keepclassmembers class kotlinx.serialization.json.** { *; }
+-dontwarn kotlinx.serialization.**
+-keep class com.topjohnwu.superuser.** { *; }
+-dontwarn com.topjohnwu.superuser.**
