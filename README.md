@@ -4,6 +4,16 @@
 
 两个硬指标：驾考任务完成，自律天数不断链。体重、饮食、英语、训练是观察项。
 
+## 下载安装
+
+到 [Releases](https://github.com/1535273240sch-droid/SelfDisciplineOS/releases) 下载最新的 `AetherOS-vX.Y.Z.apk` 直接安装（仅自用签名）。推送 `v*` tag 后 GitHub Actions 会自动构建并发布。
+
+## 更新记录
+
+- **v2.1.3** 界面距离修复：全局统一处理系统栏留白，内容不再顶进状态栏/挖孔下面；底部 Dock 改为进布局流，删掉各页面写死的 `bottom=108dp` 魔法数；所有页面统一 16dp 边距、12dp 间距；锁屏与早报页同样让开系统栏；界面风格、控件、文案与数据逻辑不变。清理不再使用的旧仪表盘代码。
+- **v2.1.2** 签名：使用正式 keystore，开启 v1/v2/v3 签名。
+- **v2.1** AI 工具链闭环、模型路由 6 场景绑定、Bento 玻璃界面。
+
 ## 构建
 
 需要 JDK 17、Android SDK Platform 36 和 Build-Tools 36。

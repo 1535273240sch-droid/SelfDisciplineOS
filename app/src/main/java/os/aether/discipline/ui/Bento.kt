@@ -18,9 +18,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -69,7 +67,7 @@ fun BentoToday(repo: AetherRepository, nav: NavHostController) {
     }
     LaunchedEffect(Unit) { while (true) { today = repo.today(); delay(1500) } }
     val bar by animateFloatAsState((today.drivingDone / today.drivingTarget.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f), aetherSpring(), label = "bar")
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 108.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    ScreenColumn {
         GlassCard(padding = 12.dp) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column {

@@ -13,13 +13,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -107,7 +104,7 @@ fun DrivingScreen(repo: AetherRepository) {
     LaunchedEffect(done) {
         if (done && sessionMock && questions.isNotEmpty()) repo.finishMock(sessionSubject, questions.size, correct)
     }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    ScreenColumn {
         Quiet("驾考 · 内置题按公开的 163/172 号令口径，不是商业题库")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AccentButton(if (subject == 1) "科一 ·" else "科一") { subject = 1 }
@@ -203,11 +200,11 @@ fun EnglishScreen(repo: AetherRepository) {
         daily = repo.dailyPhrases(count = target)
     }
     if (daily.isEmpty()) {
-        Column(Modifier.fillMaxSize().padding(18.dp)) { Quiet("正在加载今日句子") }
+        ScreenColumn { Quiet("正在加载今日句子") }
         return
     }
     val phrase = daily[index % daily.size]
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    ScreenColumn {
         Quiet(phrase.scene)
         Metric(phrase.english)
         Body(phrase.chinese)
@@ -254,7 +251,7 @@ fun WorkoutScreen() {
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
         if (granted[Manifest.permission.ACCESS_FINE_LOCATION] == true) startWorkout(context, pendingType)
     }
-    Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    ScreenColumn {
         Quiet(if (live.type == "WALK") "散步" else "跑步")
         Metric(if (live.meters <= 0f) "0.00" else "%.2f".format(live.meters / 1000f))
         Quiet("公里 · ${paceLabel(live.meters, live.seconds)} · ${live.seconds / 60}分 · 步频 ${live.cadence}")
@@ -301,7 +298,7 @@ fun CalisthenicsScreen(repo: AetherRepository) {
     var reps by remember { mutableStateOf("10") }
     var note by remember { mutableStateOf("") }
     LaunchedEffect(Unit) { rows = repo.db.calisthenics().all() }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    ScreenColumn {
         Quiet("囚徒健身 · 语音也可以直接说「第五式俯卧撑 2 组 20 个」")
         rows.forEach { row ->
             val gate = stepOf(row.moveCategory, row.currentStep)
@@ -332,7 +329,7 @@ fun ThresholdScreen(repo: AetherRepository) {
     var pin by remember { mutableStateOf("") }
     var pinNote by remember { mutableStateOf("") }
     var saveNote by remember { mutableStateOf("") }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    ScreenColumn {
         Quiet("改完立即影响仪表盘和判定")
         OutlinedTextField(pin, { if (it.length <= 6) pin = it.filter(Char::isDigit) }, label = { Text("6 位紧急密码") })
         AccentButton("保存密码") { scope.launch { pinNote = repo.setPin(pin) } }
@@ -343,13 +340,15 @@ fun ThresholdScreen(repo: AetherRepository) {
         }
             .forEach { row ->
                 var value by remember(row.key, row.updatedAt) { mutableStateOf(row.value) }
-                OutlinedTextField(value, { value = it }, label = { Text(row.label + (row.unit?.let { u -> " ($u)" } ?: "")) }, modifier = Modifier.fillMaxWidth())
-                AccentButton("保存") {
-                    scope.launch {
-                        val result = repo.saveThreshold(row.key, value)
-                        saveNote = "${row.label}：$result"
-                        if (result == "已保存") {
-                            AlarmScheduler.schedule(context.applicationContext as AetherApp)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Bottom) {
+                    OutlinedTextField(value, { value = it }, label = { Text(row.label + (row.unit?.let { u -> " ($u)" } ?: "")) }, modifier = Modifier.weight(1f))
+                    AccentButton("保存") {
+                        scope.launch {
+                            val result = repo.saveThreshold(row.key, value)
+                            saveNote = "${row.label}：$result"
+                            if (result == "已保存") {
+                                AlarmScheduler.schedule(context.applicationContext as AetherApp)
+                            }
                         }
                     }
                 }
@@ -371,7 +370,7 @@ fun BackfillScreen(repo: AetherRepository) {
     val clock = Regex("^([01]?\\d|2[0-3]):[0-5]\\d$")
     fun pastDate(day: String): Boolean =
         runCatching { LocalDate.parse(day) }.getOrNull()?.isBefore(LocalDate.now()) == true
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    ScreenColumn {
         Quiet("补录只进趋势与图表，不算当日达标，也不会把已经断掉的天数补回来。")
         OutlinedTextField(date, { date = it }, label = { Text("日期 YYYY-MM-DD") }, modifier = Modifier.fillMaxWidth())
         Quiet("体重（空腹）")
@@ -471,7 +470,7 @@ fun ProviderScreen(repo: AetherRepository) {
 
     LaunchedEffect(Unit) { bindings = repo.sceneBindings() }
 
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    ScreenColumn {
         Quiet("Key 只加密存在这台手机里，不会进源码。")
         OutlinedTextField(name, { name = it }, label = { Text("渠道名") }, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(base, { base = it }, label = { Text("Base URL") }, modifier = Modifier.fillMaxWidth())
@@ -697,7 +696,7 @@ fun RootScreen(repo: AetherRepository) {
     val scope = rememberCoroutineScope()
     var log by remember { mutableStateOf("") }
     var risk by remember { mutableStateOf("") }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    ScreenColumn {
         val owner = DeviceOwnerCtl.isOwner(context)
         Body(if (owner) "当前强度：Device Owner 真拦" else "当前强度：降级，遮罩加记账")
         Quiet("su ${if (Root.available()) "可用" else "不可用"}")
