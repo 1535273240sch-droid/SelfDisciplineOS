@@ -9,6 +9,13 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -137,11 +144,19 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     }
-                    if (voice) {
-                        VoiceLayer(
-                            repo,
-                            Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.74f),
-                        ) { voice = false }
+                    AnimatedVisibility(
+                        visible = voice,
+                        enter = slideInVertically(
+                            initialOffsetY = { it },
+                            animationSpec = spring(dampingRatio = 0.82f, stiffness = 380f),
+                        ) + fadeIn(tween(160)),
+                        exit = slideOutVertically(
+                            targetOffsetY = { it },
+                            animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f),
+                        ) + fadeOut(tween(140)),
+                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.74f),
+                    ) {
+                        VoiceLayer(repo) { voice = false }
                     }
                 }
             }

@@ -123,6 +123,10 @@ data class TodayUi(
 
 data class Bound(val provider: AiProviderConfig, val model: String, val key: String, val path: String)
 
+data class ToolOutcome(val ok: Boolean, val message: String, val payload: String? = null)
+
+data class SceneBinding(val scene: String, val providerId: Long, val providerName: String, val model: String)
+
 private data class HardSlice(
     val met: Boolean,
     val backfill: Boolean,
@@ -142,6 +146,7 @@ class AetherRepository(context: Context) {
     private val seedMutex = Mutex()
     val db: AppDatabase = AppDatabase.get(app)
     val ai = OpenAiClient()
+    @Volatile private var lastCryptoBoard: CryptoBoard? = null
     val messages = db.ai().observeMessages()
     val providers = db.ai().observeProviders()
     val thresholdRows = db.thresholds().observe()
@@ -302,7 +307,11 @@ class AetherRepository(context: Context) {
         return all[Math.floorMod(index, all.size)]
     }
 
-    suspend fun refreshCrypto(): CryptoBoard = CryptoMarket.load()
+    suspend fun refreshCrypto(): CryptoBoard {
+        val board = CryptoMarket.load()
+        lastCryptoBoard = board
+        return board
+    }
 
     suspend fun saveThreshold(key: String, value: String): String = withContext(Dispatchers.IO) {
         val existing = db.thresholds().get(key) ?: return@withContext "未知设置项：$key"
@@ -501,58 +510,110 @@ class AetherRepository(context: Context) {
         return if (notes.isEmpty()) "" else notes.joinToString("，")
     }
 
-    suspend fun executeTool(name: String, arguments: String): String {
+    suspend fun executeTool(name: String, arguments: String): ToolOutcome = try {
         val args = runCatching { JSONObject(arguments.ifBlank { "{}" }) }.getOrElse { JSONObject() }
-        return when (name) {
+        when (name) {
             "record_weight" -> runCatching {
                 val kg = args.optDouble("weight_kg")
                 if (kg.isNaN() || kg !in 30.0..250.0) error("体重需要在 30–250kg 之间")
-                recordWeight(kg.toFloat(), args.optBoolean("is_fasting", true), "VOICE")
-                "已记录体重"
-            }.getOrElse { "体重未记录：${it.message}" }
+                val fasting = args.optBoolean("is_fasting", true)
+                recordWeight(kg.toFloat(), fasting, "VOICE")
+                ToolOutcome(true, "已记录体重 ${"%.1f".format(kg)} kg（${if (fasting) "空腹" else "非空腹"}）")
+            }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "体重参数不合法"}") }
             "record_sleep" -> runCatching {
-                val sleep = args.optString("sleep_time")
-                if (normalizeClock(sleep) == null) error("入睡时间要写成 HH:mm")
-                recordSleep(sleep, args.optString("wake_time").ifBlank { null })
-                "已记录作息"
-            }.getOrElse { "作息未记录：${it.message}" }
+                val sleep = normalizeClock(args.optString("sleep_time"))
+                    ?: error("入睡时间要写成 HH:mm")
+                val wake = normalizeClock(args.optString("wake_time").ifBlank { null })
+                recordSleep(sleep, wake)
+                ToolOutcome(true, "已记录作息：$sleep 入睡" + (wake?.let { "，$it 起床" } ?: ""))
+            }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "作息参数不合法"}") }
             "record_diet" -> runCatching {
                 val items = args.optString("items").trim()
                 if (items.isBlank()) error("缺少吃了什么")
                 val meal = args.optString("meal_type", "SNACK").uppercase()
                     .takeIf { it in setOf("BREAKFAST", "LUNCH", "DINNER", "SNACK") } ?: "SNACK"
+                val calories = args.optInt("calories")
                 recordDiet(
                     meal,
                     items,
-                    args.optInt("calories"),
+                    calories,
                     args.optDouble("protein_g").toFloat(),
                     args.optDouble("carbs_g").toFloat(),
                     args.optDouble("fat_g").toFloat(),
-                    needsBackfill = args.optInt("calories") == 0,
+                    needsBackfill = calories == 0,
                 )
-                "已记录饮食"
-            }.getOrElse { "饮食未记录：${it.message}" }
+                ToolOutcome(true, "已记录饮食：$items" + if (calories > 0) "（$calories kcal）" else "")
+            }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "饮食参数不合法"}") }
             "record_calisthenics" -> runCatching {
                 val sets = args.optInt("sets", 1)
                 val reps = args.optInt("reps")
                 if (sets <= 0 || reps < 0) error("组数和次数不合法")
-                recordCalisthenics(
+                val message = recordCalisthenics(
                     args.optString("category", "PUSHUP"),
                     args.optInt("step"),
                     sets,
                     reps,
                 )
-            }.getOrElse { "训练未记录：${it.message}" }
-            "render_analytics_widget" -> analyticsPayload(args.optInt("days", 14).coerceIn(1, 90))
+                if (message.startsWith("动作分类不认识")) ToolOutcome(false, "未记录：$message")
+                else ToolOutcome(true, "$message（$sets 组 × $reps 次）")
+            }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "训练参数不合法"}") }
+            "render_analytics_widget" -> ToolOutcome(
+                true,
+                "已生成图表",
+                analyticsPayload(args.optInt("days", 14).coerceIn(1, 90)),
+            )
             "remember" -> {
                 val key = args.optString("key").trim()
-                if (key.isBlank()) "记忆键不能为空" else {
-                    db.ai().upsertMemory(AiMemoryProfile(key, args.optString("value").trim(), System.currentTimeMillis()))
-                    "已记住"
+                val value = args.optString("value").trim()
+                when {
+                    key.isBlank() -> ToolOutcome(false, "未记录：记忆键不能为空")
+                    value.isBlank() -> ToolOutcome(false, "未记录：记忆值不能为空")
+                    else -> {
+                        db.ai().upsertMemory(AiMemoryProfile(key, value, System.currentTimeMillis()))
+                        ToolOutcome(true, "已记住：$key=$value")
+                    }
                 }
             }
-            else -> "未知工具"
+            "bump_learning_module" -> runCatching {
+                val moduleId = args.optString("module_id").trim()
+                if (moduleId.isBlank()) error("缺少 module_id")
+                val row = db.learning().get(moduleId) ?: error("找不到模块 $moduleId")
+                val amountRaw = args.optString("amount").trim()
+                val amount = if (amountRaw.isBlank()) 1 else amountRaw.toDoubleOrNull()?.toInt() ?: error("amount 需要数字")
+                bumpModule(moduleId, amount)
+                val updated = db.learning().get(moduleId) ?: row
+                ToolOutcome(
+                    true,
+                    "已给「${updated.title}」累加 $amount，当前 ${updated.currentValue}/${updated.targetValue} ${updated.unit}",
+                )
+            }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "累加失败"}") }
+            "set_hard_module" -> runCatching {
+                val moduleId = args.optString("module_id").trim()
+                if (moduleId.isBlank()) error("缺少 module_id")
+                val row = db.learning().get(moduleId) ?: error("找不到模块 $moduleId")
+                if (row.isArchived) error("模块「${row.title}」已归档")
+                setHardModule(moduleId)
+                ToolOutcome(true, "已把「${row.title}」设为防断链硬指标")
+            }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "设置失败"}") }
+            "add_learning_module" -> runCatching {
+                val title = args.optString("title").trim()
+                if (title.isBlank()) error("缺少模块标题")
+                val targetRaw = args.optString("target_value").trim()
+                if (targetRaw.isBlank()) error("缺少 target_value")
+                val target = targetRaw.toDoubleOrNull()?.toInt() ?: error("target_value 需要数字")
+                if (target <= 0) error("target_value 要大于 0")
+                val template = args.optString("template_type", "DAILY_QUOTA").trim().uppercase()
+                    .takeIf { it in setOf("DAILY_QUOTA", "COUNTDOWN_SPRINT", "CRYPTO_TRACKER") } ?: "DAILY_QUOTA"
+                val id = addModule(title, target, template)
+                val unit = args.optString("unit").trim()
+                if (unit.isNotBlank()) db.learning().get(id)?.let { db.learning().upsert(it.copy(unit = unit)) }
+                val row = db.learning().get(id)
+                ToolOutcome(true, "已添加学习模块「${row?.title ?: title}」，目标 ${row?.targetValue ?: target}${row?.unit ?: ""}")
+            }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "添加失败"}") }
+            else -> ToolOutcome(false, "未记录：未知工具 ${name.ifBlank { "（空）" }}")
         }
+    } catch (e: Exception) {
+        ToolOutcome(false, "未记录：${e.message ?: "工具执行失败"}")
     }
 
     suspend fun snapshot(): String = withContext(Dispatchers.IO) {
@@ -568,17 +629,39 @@ class AetherRepository(context: Context) {
         }
         val memory = db.ai().memory().filter { it.value.isNotBlank() }.joinToString("；") { "${it.key}=${it.value}" }
         val reasons = db.violations().forDate(date).joinToString("、") { violationLabel(it.type) }
-        """
-        今日 $date ${ui.weekday}。连续自律 ${ui.streak} 天，最长 ${ui.maxStreak} 天。今日状态 ${ui.status}。
-        硬项：作息 ${ui.sleepText}；驾考 ${ui.drivingDone}/${ui.drivingTarget}（${ui.phase}）；体重/饮食/作息入库 ${if (ui.dataMet) "齐" else "未齐"}。
-        ${if (reasons.isBlank()) "今天还没有破戒记录。" else "今天已发生：$reasons。"}
-        体重趋势（只给日期和公斤，没有时刻）：$trend
-        今日热量 ${ui.calories} / 上限 ${ui.calorieLimit} kcal，蛋白 ${ui.protein}g，碳水 ${ui.carbs}g，脂肪 ${ui.fat}g。
-        $workoutText
-        英语今天 ${ui.englishDone}/${ui.englishTarget}。${ui.steps}
-        ${ui.examText}。${ui.travelText}。
-        长期记忆：$memory
-        """.trimIndent()
+        val hard = hardProgress(date, t)
+        val goals = buildList {
+            t.targetWeightKg?.let { add("目标体重 ${"%.1f".format(it)}kg") }
+            t.examDate?.let { add("考试 $it（剩 ${java.time.temporal.ChronoUnit.DAYS.between(LocalDate.now(), it)} 天）") }
+            t.travelDate?.let { add("出行 $it（剩 ${java.time.temporal.ChronoUnit.DAYS.between(LocalDate.now(), it)} 天）") }
+        }
+        val briefing = ui.briefingHead.map { it.take(60) }
+        val whitelistText = when {
+            t.whitelistPackages.isEmpty() -> ""
+            t.whitelistPackages.size > 6 -> "紧急白名单：" + t.whitelistPackages.take(6).joinToString("、") + " 等 ${t.whitelistPackages.size} 个"
+            else -> "紧急白名单：" + t.whitelistPackages.joinToString("、")
+        }
+        val cryptoText = lastCryptoBoard?.let { board ->
+            val prices = board.quotes.take(3).joinToString(" ") { "${it.pair} ${it.price}" }
+            if (prices.isBlank()) "" else "最近行情：$prices（恐慌贪婪 ${board.fearGreed}）"
+        }.orEmpty()
+        buildString {
+            appendLine("今日 $date ${ui.weekday}。连续自律 ${ui.streak} 天，最长 ${ui.maxStreak} 天。今日状态 ${ui.status}。")
+            appendLine("当前防断链硬指标：${hard.title} ${hard.done}/${hard.target} ${hard.unit}。")
+            appendLine("硬项：作息 ${ui.sleepText}；体重/饮食/作息入库 ${if (ui.dataMet) "齐" else "未齐"}。")
+            appendLine("锁屏时间：工作日 ${t.weekdayLock.hhmm()} / 周末 ${t.weekendLock.hhmm()}。")
+            if (goals.isNotEmpty()) appendLine("目标：" + goals.joinToString("；") + "。")
+            if (briefing.isNotEmpty()) appendLine("今日早报：" + briefing.joinToString("；") + "。")
+            if (whitelistText.isNotBlank()) appendLine("$whitelistText。")
+            if (cryptoText.isNotBlank()) appendLine("$cryptoText。")
+            appendLine(if (reasons.isBlank()) "今天还没有破戒记录。" else "今天已发生：$reasons。")
+            appendLine("体重趋势（只给日期和公斤，没有时刻）：$trend")
+            appendLine("今日热量 ${ui.calories} / 上限 ${ui.calorieLimit} kcal，蛋白 ${ui.protein}g，碳水 ${ui.carbs}g，脂肪 ${ui.fat}g。")
+            appendLine(workoutText)
+            appendLine("英语今天 ${ui.englishDone}/${ui.englishTarget}。${ui.steps}")
+            appendLine("${ui.examText}。${ui.travelText}。")
+            appendLine("长期记忆：$memory")
+        }.trim().take(1800)
     }
 
     suspend fun analyticsPayload(days: Int): String = withContext(Dispatchers.IO) {
@@ -626,7 +709,30 @@ class AetherRepository(context: Context) {
         db.ai().updateProvider(row.copy(cachedModelsJson = JSONArray(models).toString()))
     }
 
-    suspend fun deleteProvider(id: Long) = db.ai().deleteProvider(id)
+    suspend fun cachedModels(providerId: Long): List<String> {
+        val raw = db.ai().provider(providerId)?.cachedModelsJson ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            buildList {
+                for (i in 0 until array.length()) {
+                    val model = array.optString(i).trim()
+                    if (model.isNotBlank()) add(model)
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun deleteProvider(id: Long) {
+        val target = id.toString()
+        db.thresholds().all()
+            .filter { it.key.startsWith("scene_") && it.key.endsWith("_provider") && it.value.trim() == target }
+            .forEach { row ->
+                val scene = row.key.removePrefix("scene_").removeSuffix("_provider")
+                putRaw(row.key, "")
+                putRaw("scene_${scene}_model", "")
+            }
+        db.ai().deleteProvider(id)
+    }
 
     suspend fun bound(scene: String): Bound? {
         val id = raw("scene_${scene}_provider").toLongOrNull() ?: return null
@@ -641,6 +747,28 @@ class AetherRepository(context: Context) {
     suspend fun bind(scene: String, providerId: Long, model: String) {
         putRaw("scene_${scene}_provider", providerId.toString())
         putRaw("scene_${scene}_model", model)
+    }
+
+    suspend fun unbind(scene: String) {
+        val key = scene.trim()
+        if (key.isBlank()) return
+        putRaw("scene_${key}_provider", "")
+        putRaw("scene_${key}_model", "")
+    }
+
+    suspend fun sceneBindings(): List<SceneBinding> {
+        val rows = db.thresholds().all()
+        val values = rows.associate { it.key to it.value }
+        return rows.mapNotNull { row ->
+            if (!row.key.startsWith("scene_") || !row.key.endsWith("_provider")) return@mapNotNull null
+            val scene = row.key.removePrefix("scene_").removeSuffix("_provider")
+            if (scene.isBlank()) return@mapNotNull null
+            val providerId = row.value.trim().toLongOrNull() ?: return@mapNotNull null
+            val model = values["scene_${scene}_model"]?.trim().orEmpty()
+            if (model.isBlank()) return@mapNotNull null
+            val provider = db.ai().provider(providerId) ?: return@mapNotNull null
+            SceneBinding(scene, providerId, provider.providerName, model)
+        }.sortedBy { it.scene }
     }
 
     suspend fun importQuestions(json: String): Int {
@@ -778,7 +906,12 @@ class AetherRepository(context: Context) {
         recompute(date, true)
         val row = db.streak().get(date) ?: return@withContext
         if (row.status != "BROKEN") return@withContext
-        if (!row.drivingTargetMet) addViolation(date, "DRIVING_NOT_MET", "当日题量未完成", true)
+        if (!row.drivingTargetMet) {
+            val title = db.learning().ordered()
+                .firstOrNull { it.countsTowardsStreak && !it.isArchived }
+                ?.title?.takeIf { it.isNotBlank() } ?: "每日硬指标"
+            addViolation(date, "DRIVING_NOT_MET", "「$title」未达标", true)
+        }
         if (!row.weightLogged || !row.dietLogged || !row.sleepRecorded) addViolation(date, "DATA_NOT_LOGGED", "体重、饮食或作息缺实时记录", true)
     }
 

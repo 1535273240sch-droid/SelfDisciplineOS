@@ -18,28 +18,34 @@ object KeystoreCrypto {
 
     fun encrypt(plain: String): String {
         if (plain.isEmpty()) return ""
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, key())
-        val iv = cipher.iv
-        val encrypted = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
-        val packed = ByteArray(iv.size + encrypted.size)
-        iv.copyInto(packed)
-        encrypted.copyInto(packed, iv.size)
-        return Base64.encodeToString(packed, Base64.NO_WRAP)
+        return try {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, key())
+            val iv = cipher.iv
+            val encrypted = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
+            val packed = ByteArray(iv.size + encrypted.size)
+            iv.copyInto(packed)
+            encrypted.copyInto(packed, iv.size)
+            Base64.encodeToString(packed, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            throw IllegalStateException("Keystore 加密不可用：${e.message}")
+        }
     }
 
-    fun decrypt(blob: String): String {
+    fun decrypt(blob: String): String = decryptOrNull(blob) ?: ""
+
+    fun decryptOrNull(blob: String): String? {
         if (blob.isBlank()) return ""
         return try {
             val packed = Base64.decode(blob, Base64.NO_WRAP)
-            if (packed.size <= IV_SIZE) return ""
+            if (packed.size <= IV_SIZE) return null
             val iv = packed.copyOfRange(0, IV_SIZE)
             val body = packed.copyOfRange(IV_SIZE, packed.size)
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(TAG_BITS, iv))
             String(cipher.doFinal(body), Charsets.UTF_8)
         } catch (_: Exception) {
-            ""
+            null
         }
     }
 

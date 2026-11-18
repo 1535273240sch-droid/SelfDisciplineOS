@@ -30,6 +30,8 @@ data class ToolCall(val id: String, val name: String, val arguments: String)
 
 data class ChatResult(val content: String, val tools: List<ToolCall>, val error: String? = null)
 
+data class StreamResult(val text: String, val error: String? = null)
+
 interface OpenAiHttp {
     @GET
     suspend fun get(
@@ -61,8 +63,12 @@ class OpenAiClient {
     suspend fun listModels(baseUrl: String, apiKey: String): List<String> {
         val response = api.get(modelsUrl(baseUrl), bearer(apiKey))
         val text = response.body()?.string().orEmpty()
-        if (!response.isSuccessful) error(text.ifBlank { "HTTP ${response.code()}" })
-        val data = JSONObject(text).optJSONArray("data") ?: JSONArray()
+        if (!response.isSuccessful) {
+            throw IllegalStateException(
+                if (text.isBlank()) "HTTP ${response.code()}" else "HTTP ${response.code()}: ${text.take(300)}",
+            )
+        }
+        val data = runCatching { JSONObject(text).optJSONArray("data") }.getOrNull() ?: return emptyList()
         return buildList {
             for (i in 0 until data.length()) {
                 val id = data.optJSONObject(i)?.optString("id").orEmpty()
@@ -91,7 +97,13 @@ class OpenAiClient {
             payload.toString().toRequestBody(JSON),
         )
         val text = response.body()?.string().orEmpty()
-        if (!response.isSuccessful) return ChatResult("", emptyList(), text.ifBlank { "HTTP ${response.code()}" })
+        if (!response.isSuccessful) {
+            return ChatResult(
+                "",
+                emptyList(),
+                if (text.isBlank()) "HTTP ${response.code()}" else "HTTP ${response.code()}: ${text.take(400)}",
+            )
+        }
         return parseChat(text)
     }
 
@@ -100,7 +112,7 @@ class OpenAiClient {
         apiKey: String,
         model: String,
         messages: JSONArray,
-    ): String = suspendCancellableCoroutine { cont ->
+    ): StreamResult = suspendCancellableCoroutine { cont ->
         val payload = JSONObject()
             .put("model", model)
             .put("temperature", 0.7)
@@ -123,12 +135,17 @@ class OpenAiClient {
             }
 
             override fun onClosed(eventSource: EventSource) {
-                if (cont.isActive) cont.resume(acc.toString())
+                if (cont.isActive) cont.resume(StreamResult(acc.toString()))
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: okhttp3.Response?) {
                 if (!cont.isActive) return
-                if (acc.isNotEmpty()) cont.resume(acc.toString()) else cont.resume("")
+                val err = "HTTP ${response?.code ?: ""} ${t?.message ?: "网络中断"}".trim()
+                if (acc.isEmpty()) {
+                    cont.resume(StreamResult("", err))
+                } else {
+                    cont.resume(StreamResult(acc.toString(), "回复中断：$err"))
+                }
             }
         })
         cont.invokeOnCancellation { source.cancel() }
@@ -243,4 +260,7 @@ fun toolSchema(): JSONArray {
         .put(fn("record_calisthenics", "记录囚徒健身", JSONObject().put("category", str("PUSHUP SQUAT PULLUP LEG_RAISE BRIDGE HANDSTAND")).put("step", num("第几式")).put("sets", num("组")).put("reps", num("每组次数")), JSONArray().put("category").put("sets").put("reps")))
         .put(fn("render_analytics_widget", "在对话里画表和趋势图", JSONObject().put("days", num("天数，默认14")), JSONArray()))
         .put(fn("remember", "写入长期记忆", JSONObject().put("key", str("键")).put("value", str("值")), JSONArray().put("key").put("value")))
+        .put(fn("bump_learning_module", "给学习模块增加进度。必须调用这个工具，不要自己猜数字或口算进度。", JSONObject().put("module_id", str("driving/english/crypto/kline 或自定义 id")).put("amount", num("增加的数量，默认 1")), JSONArray().put("module_id")))
+        .put(fn("set_hard_module", "把某个学习模块设为当前硬目标。必须调用这个工具，不要自己臆测模块 id。", JSONObject().put("module_id", str("模块 id")), JSONArray().put("module_id")))
+        .put(fn("add_learning_module", "新建学习模块。必须调用这个工具，不要自己编造目标数字或进度。", JSONObject().put("title", str("模块名称")).put("target_value", num("目标值")).put("unit", str("单位，如 次/页/天")).put("template_type", str("模板类型，取值 DAILY_QUOTA / COUNTDOWN_SPRINT / CRYPTO_TRACKER")), JSONArray().put("title").put("target_value")))
 }

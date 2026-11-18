@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -29,6 +31,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
@@ -105,12 +112,22 @@ fun BentoToday(repo: AetherRepository, nav: NavHostController) {
                 Quiet(if (today.deltaText.isBlank()) "较昨日 —" else "较昨日 ${today.deltaText}")
             }
             GlassCard(Modifier.weight(1f)) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Quiet("热量摄入")
                     AccentButton("识餐") { shot = "meal"; permit.launch(Manifest.permission.CAMERA) }
                 }
-                Metric("${today.calories}", size = 26)
-                Quiet("上限 ${if (today.calorieLimit == 0) "未设" else today.calorieLimit} · 蛋白 ${today.protein}g")
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(9.dp),
+                ) {
+                    CalorieRing(today.calories, today.calorieLimit, Modifier.size(64.dp))
+                    Column(Modifier.weight(1f)) {
+                        Metric(if (today.calorieLimit == 0) "未设上限" else "上限 ${today.calorieLimit}", size = 15)
+                        Quiet("蛋白 ${today.protein}g · 碳水 ${today.carbs}g")
+                        Quiet("脂肪 ${today.fat}g")
+                    }
+                }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -148,6 +165,40 @@ fun BentoToday(repo: AetherRepository, nav: NavHostController) {
                     AccentButton("丢弃") { vision = "" }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun CalorieRing(consumed: Int, limit: Int, modifier: Modifier = Modifier) {
+    val colors = LocalAether.current
+    val target = if (limit <= 0) 1 else limit
+    val ratio by animateFloatAsState((consumed.toFloat() / target).coerceIn(0f, 1f), aetherSpring(), label = "kcal")
+    val over = limit in 1..consumed
+    Box(modifier, contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val stroke = 7.dp.toPx()
+            val inset = stroke / 2
+            val arc = Size(size.width - stroke, size.height - stroke)
+            drawArc(
+                colors.textSecondary.copy(alpha = 0.14f),
+                0f, 360f, false,
+                topLeft = Offset(inset, inset), size = arc,
+                style = Stroke(stroke, cap = StrokeCap.Round),
+            )
+            if (ratio > 0f) {
+                val sweep = colors.accent.let { if (over) colors.danger else it }
+                drawArc(
+                    brush = Brush.sweepGradient(listOf(sweep.copy(alpha = 0.55f), sweep, sweep.copy(alpha = 0.55f))),
+                    startAngle = -90f, sweepAngle = 360f * ratio, useCenter = false,
+                    topLeft = Offset(inset, inset), size = arc,
+                    style = Stroke(stroke, cap = StrokeCap.Round),
+                )
+            }
+        }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Metric("$consumed", size = 17)
+            Quiet("kcal")
         }
     }
 }

@@ -44,6 +44,7 @@ import os.aether.discipline.AetherApp
 import os.aether.discipline.domain.AlwaysLockPackages
 import os.aether.discipline.domain.isWeekend
 import os.aether.discipline.ui.AccentButton
+import os.aether.discipline.ui.AetherPureBlack
 import os.aether.discipline.ui.AetherTheme
 import os.aether.discipline.ui.Body
 import os.aether.discipline.ui.GlassCard
@@ -90,13 +91,13 @@ class LockActivity : ComponentActivity() {
                     delay(1000)
                 }
             }
-            AetherTheme("midnight") {
+            AetherPureBlack {
                 Column(Modifier.fillMaxSize().padding(28.dp), verticalArrangement = Arrangement.SpaceBetween) {
                     Quiet(if (LockRuntime.inEmergency()) "紧急通行中" else "该睡了")
                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxSize().weight(1f, false)) {
                         Text(clock, color = androidx.compose.ui.graphics.Color.White, fontSize = 72.sp, fontWeight = FontWeight.Light, textAlign = TextAlign.Center)
                         Spacer(Modifier.height(18.dp))
-                        GlassCard { Body(note) }
+                        Quiet(note)
                     }
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         if (asking) {

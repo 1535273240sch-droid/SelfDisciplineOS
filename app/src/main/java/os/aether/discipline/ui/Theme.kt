@@ -119,6 +119,24 @@ fun AetherTheme(id: String, content: @Composable BoxScope.() -> Unit) {
 }
 
 @Composable
+fun AetherPureBlack(content: @Composable BoxScope.() -> Unit) {
+    val colors = Midnight
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as Activity).window
+            window.statusBarColor = android.graphics.Color.BLACK
+            window.navigationBarColor = android.graphics.Color.BLACK
+            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = false
+            WindowCompat.getInsetsController(window, view).isAppearanceLightNavigationBars = false
+        }
+    }
+    CompositionLocalProvider(LocalAether provides colors, LocalHaze provides null) {
+        Box(Modifier.fillMaxSize().background(Color.Black), content = content)
+    }
+}
+
+@Composable
 private fun AmbientCanvas(modifier: Modifier, colors: AetherColors) {
     androidx.compose.foundation.Canvas(modifier) {
         drawCircle(colors.orb1.copy(alpha = 0.75f), radius = size.minDimension * 0.42f, center = Offset(-40f, -20f))

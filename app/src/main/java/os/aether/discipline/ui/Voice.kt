@@ -11,19 +11,23 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -40,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -47,12 +52,16 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.chrisbanes.haze.HazeStyle
+import dev.chrisbanes.haze.HazeTint
+import dev.chrisbanes.haze.hazeEffect
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import os.aether.discipline.ai.ChatResult
 import os.aether.discipline.ai.toolSchema
 import os.aether.discipline.data.AetherRepository
 import os.aether.discipline.domain.SYSTEM_PROMPT
@@ -107,7 +116,39 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
             }
         }
     }
-    Column(modifier.fillMaxWidth().background(colors.surface).padding(16.dp)) {
+    val sheetShape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+    val haze = LocalHaze.current
+    val sheetGlass = if (haze != null) {
+        Modifier.hazeEffect(
+            haze,
+            HazeStyle(
+                backgroundColor = colors.surfaceStrong,
+                tints = listOf(HazeTint(colors.surfaceStrong.copy(alpha = 0.92f))),
+                blurRadius = 30.dp,
+                noiseFactor = 0.06f,
+            ),
+        )
+    } else {
+        Modifier.background(colors.surfaceStrong)
+    }
+    Column(
+        modifier
+            .fillMaxWidth()
+            .fillMaxHeight()
+            .clip(sheetShape)
+            .then(sheetGlass)
+            .border(0.8.dp, Brush.verticalGradient(listOf(colors.rimTop, colors.rimBottom)), sheetShape)
+            .navigationBarsPadding()
+            .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 12.dp),
+    ) {
+        Box(Modifier.fillMaxWidth().padding(bottom = 8.dp), contentAlignment = Alignment.Center) {
+            Box(
+                Modifier
+                    .size(width = 38.dp, height = 4.dp)
+                    .clip(RoundedCornerShape(99.dp))
+                    .background(colors.textSecondary.copy(alpha = 0.35f)),
+            )
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Quiet("搭档")
             Text("关闭", color = colors.accent, modifier = Modifier.padding(8.dp).clip(CircleShape).background(colors.surface).padding(8.dp).pointerInput(Unit) { detectTapGestures { onClose() } })
@@ -185,6 +226,23 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
     }
 }
 
+private const val BRAIN_RULES = """
+你现在就是这个 App 的操作系统级大脑，可以直接读写本机数据，不需要用户再去别的页面手动操作。
+可用工具（写数据必须走工具，禁止在回复里假装已经记录）：
+- record_weight / record_sleep / record_diet / record_calisthenics：体重、入睡、饮食、囚徒健身
+- bump_learning_module(module_id, amount)：累加学习模块进度，module_id 用 driving / english / kline / crypto 或自定义 id
+- set_hard_module(module_id)：切换当天防断链硬指标
+- add_learning_module(title, target_value, unit, template_type)：新建阶段模块
+- render_analytics_widget：在对话里画趋势图
+- remember：写入长期记忆
+规则：
+1. 一句话里有多件事就并行调用多个工具；字段不确定就先问一句，不要猜。
+2. 工具返回失败时如实说明原因，绝不能声称已记录。
+3. 写完后用一两句话确认写入值，并结合下方状态指出今天还差什么。
+4. 锁屏、权限、删除数据这类破坏性操作只给建议，不要代替用户执行。
+5. 用户问“我今天怎么样”时，直接引用下方状态里的真实数字，不要编。
+"""
+
 private suspend fun submit(
     repo: AetherRepository,
     tts: TextToSpeech,
@@ -193,50 +251,147 @@ private suspend fun submit(
     onStatus: (String) -> Unit,
 ) {
     onStatus("在听")
-    val heard = typed ?: audio?.takeIf { it.exists() && it.length() > 1000 }?.let { file ->
-        val bound = repo.bound("transcribe")
-        if (bound == null) "" else runCatching { repo.ai.transcribe(bound.provider.baseUrl, bound.key, bound.path, bound.model, file) }.getOrDefault("")
-    }.orEmpty()
+    val heard: String = if (typed != null) {
+        typed
+    } else {
+        val bound = repo.bound("transcribe") ?: run {
+            onStatus("还没绑定语音转写模型：设置 → AI 路由中心")
+            return
+        }
+        val file = audio?.takeIf { it.exists() && it.length() > 1000 } ?: run {
+            onStatus("没听清。点右边键盘。")
+            return
+        }
+        runCatching { repo.ai.transcribe(bound.provider.baseUrl, bound.key, bound.path, bound.model, file) }
+            .getOrElse {
+                onStatus("转写失败：" + (it.message ?: "网络异常").take(80))
+                return
+            }
+    }
     if (heard.isBlank()) {
-        onStatus(if (typed == null) "没听清。点右边键盘。" else "")
+        onStatus("没听清。点右边键盘。")
         return
     }
     repo.saveMessage("USER", heard)
     val local = parseUtterance(heard, LocalTime.now().hour)
     val fast = repo.bound("fast") ?: repo.bound("companion")
     val toolNames = mutableSetOf<String>()
+    val toolNotes = mutableListOf<String>()
     var widget: String? = null
+    var fastError: String? = null
+
     if (fast != null) {
-        val messages = JSONArray().put(JSONObject().put("role", "system").put("content", "只提取能入库的事实并调用工具。不要闲聊，不要编造。"))
+        val extract = JSONArray()
+            .put(JSONObject().put("role", "system").put("content", "只提取能入库的事实并调用工具。不要闲聊，不要编造；字段不确定就不要调用。"))
             .put(JSONObject().put("role", "user").put("content", heard))
-        val result = repo.ai.chat(fast.provider.baseUrl, fast.key, fast.model, messages, toolSchema(), 0.1)
+        val result = runCatching { repo.ai.chat(fast.provider.baseUrl, fast.key, fast.model, extract, toolSchema(), 0.1) }
+            .getOrElse { ChatResult("", emptyList(), it.message ?: "网络异常") }
+        fastError = result.error
         result.tools.forEach { call ->
-            toolNames += call.name
             val out = repo.executeTool(call.name, call.arguments)
-            if (call.name == "render_analytics_widget") widget = out
+            if (out.ok) {
+                toolNames += call.name
+                toolNotes += out.message
+                if (call.name == "render_analytics_widget") widget = out.payload
+            } else {
+                toolNotes += out.message
+            }
         }
     }
     if ("record_weight" !in toolNames) local.weight?.let { repo.recordWeight(it.kg, it.fasting, if (fast == null) "VOICE_LOCAL_FALLBACK" else "VOICE") }
     if ("record_sleep" !in toolNames) local.sleep?.let { repo.recordSleep(it.sleepHHmm, it.wakeHHmm) }
     if ("record_diet" !in toolNames) local.diet?.let { repo.recordDiet(it.mealType, it.description, 0, 0f, 0f, 0f, needsBackfill = true) }
     if ("record_calisthenics" !in toolNames) local.calisthenics?.let { repo.recordCalisthenics(it.category, it.step, it.sets, it.reps) }
+
     val companion = repo.bound("companion")
-    val reply = if (companion == null) {
-        if (local.weight == null && local.sleep == null && local.diet == null && local.calisthenics == null) {
-            "先在设置里绑一个搭档模型。这句话里没有听出体重、作息或饮食。"
-        } else {
-            "本地已记，AI 恢复后补全。"
+    var reply = ""
+    if (companion == null) {
+        reply = when {
+            toolNotes.isNotEmpty() -> "已写入：" + toolNotes.take(3).joinToString("；") + "。先在设置里绑一个搭档模型，我就能接着聊。"
+            fastError != null -> "记录请求失败：" + fastError.orEmpty().take(120)
+            local.weight == null && local.sleep == null && local.diet == null && local.calisthenics == null ->
+                "先在设置里绑一个搭档模型。这句话里没有听出体重、作息或饮食。"
+            else -> "本地已记，AI 恢复后补全。"
         }
     } else {
-        val snapshot = repo.snapshot()
-        val messages = JSONArray()
-            .put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT + "\n\n" + snapshot))
-            .put(JSONObject().put("role", "user").put("content", heard))
         onStatus("在想")
-        val streamed = runCatching { repo.ai.streamChat(companion.provider.baseUrl, companion.key, companion.model, messages) }.getOrDefault("")
-        streamed.ifBlank { repo.ai.chat(companion.provider.baseUrl, companion.key, companion.model, messages).content }
-            .ifBlank { "我听见了，但模型没有把话说完。" }
+        val messages = JSONArray()
+            .put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT + "\n\n" + BRAIN_RULES + "\n\n" + repo.snapshot()))
+            .put(JSONObject().put("role", "user").put("content", heard))
+        if (toolNotes.isNotEmpty()) {
+            messages.put(
+                JSONObject().put("role", "system")
+                    .put("content", "刚才已执行的本地写入：" + toolNotes.take(4).joinToString("；") + "。不要重复写入，失败项如实说明。"),
+            )
+        }
+        var lastError: String? = null
+        var rounds = 0
+        while (rounds < 3) {
+            rounds++
+            val res = runCatching {
+                repo.ai.chat(companion.provider.baseUrl, companion.key, companion.model, messages, toolSchema(), 0.7)
+            }.getOrElse { ChatResult("", emptyList(), it.message ?: "网络异常") }
+            lastError = res.error
+            if (res.error != null) break
+            if (res.tools.isEmpty()) {
+                if (res.content.isNotBlank()) reply = res.content.trim()
+                break
+            }
+            val assistant = JSONObject().put("role", "assistant").put("content", res.content)
+            val calls = JSONArray()
+            res.tools.forEach { call ->
+                calls.put(
+                    JSONObject().put("id", call.id).put("type", "function")
+                        .put("function", JSONObject().put("name", call.name).put("arguments", call.arguments)),
+                )
+            }
+            assistant.put("tool_calls", calls)
+            messages.put(assistant)
+            res.tools.forEach { call ->
+                val out = repo.executeTool(call.name, call.arguments)
+                if (out.ok) {
+                    toolNames += call.name
+                    toolNotes += out.message
+                    if (call.name == "render_analytics_widget") widget = out.payload
+                }
+                messages.put(
+                    JSONObject().put("role", "tool").put("tool_call_id", call.id)
+                        .put("content", if (out.ok) out.message else "执行失败：" + out.message),
+                )
+            }
+        }
+        if (reply.isBlank()) {
+            val err = lastError
+            if (err == null) {
+                reply = if (toolNotes.isEmpty()) "我听见了，但模型没有给出回复。"
+                else "已写入：" + toolNotes.take(3).joinToString("；") + "。"
+            } else if (err.contains("401") || err.contains("403")) {
+                reply = "API Key 无效或已过期（" + err.take(40) + "）。设置 → AI 路由中心重新保存 Key。"
+            } else if (err.contains("429")) {
+                reply = "请求太频繁或额度不足（429）。过一会儿再试，或换一个渠道。"
+            } else if (err.contains("tool", true) || err.contains("function", true)) {
+                val plain = JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT + "\n\n" + repo.snapshot()))
+                    .put(JSONObject().put("role", "user").put("content", heard))
+                val streamed = runCatching {
+                    repo.ai.streamChat(companion.provider.baseUrl, companion.key, companion.model, plain)
+                }.getOrNull()
+                val streamedText = streamed?.text.orEmpty()
+                val streamedError = streamed?.error
+                reply = when {
+                    streamedText.isNotBlank() -> streamedText.trim()
+                    streamedError != null -> "这个模型不支持工具调用，普通对话也失败了：" + streamedError.take(120)
+                    else -> "这个模型不支持工具调用，已按普通对话重试但没有结果。"
+                }
+            } else {
+                reply = "模型调用失败：" + err.take(160)
+            }
+        }
     }
+    if (toolNotes.isNotEmpty() && !reply.contains("已写入") && !reply.contains("已记录")) {
+        reply = reply.trimEnd() + "\n\n已写入：" + toolNotes.take(3).joinToString("；")
+    }
+
     val wantChart = heard.contains("对比") || heard.contains("趋势") || heard.contains("曲线") || heard.contains("表格")
     val payload = widget ?: if (wantChart) repo.analyticsPayload(14) else null
     repo.saveMessage("ASSISTANT", reply, if (payload != null) "WEIGHT_SLEEP_CHART" else null, payload)
@@ -247,7 +402,8 @@ private suspend fun submit(
         if (mouth != null) {
             val bytes = runCatching { repo.ai.tts(mouth.provider.baseUrl, mouth.key, mouth.path, mouth.model, reply) }.getOrNull()
             if (bytes != null && bytes.size > 32) {
-                val file = File(repo.db.openHelper.writableDatabase.path).parentFile?.let { File(it, "reply.mp3") } ?: return
+                val dbPath = repo.db.openHelper.writableDatabase.path ?: return
+                val file = File(dbPath).parentFile?.let { File(it, "reply.mp3") } ?: return
                 file.writeBytes(bytes)
                 MediaPlayer().apply { setDataSource(file.absolutePath); prepare(); start() }
                 return
