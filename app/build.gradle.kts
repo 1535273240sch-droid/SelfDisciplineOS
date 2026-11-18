@@ -10,12 +10,27 @@ android {
     namespace = "os.aether.discipline"
     compileSdk = 36
 
+    signingConfigs {
+        create("aether") {
+            val ks = rootProject.file("keystore/aether-release.jks")
+            if (ks.exists()) {
+                storeFile = ks
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "aether2026"
+                keyAlias = System.getenv("KEY_ALIAS") ?: "aether"
+                keyPassword = System.getenv("KEY_PASSWORD") ?: "aether2026"
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     defaultConfig {
         applicationId = "os.aether.discipline"
         minSdk = 30
         targetSdk = 36
-        versionCode = 4
-        versionName = "2.1.1"
+        versionCode = 5
+        versionName = "2.1.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
@@ -23,7 +38,11 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (rootProject.file("keystore/aether-release.jks").exists()) {
+                signingConfigs.getByName("aether")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

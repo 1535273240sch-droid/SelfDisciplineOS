@@ -17,3 +17,6 @@ local.properties
 .kotlin/
 *.hprof
 /docs/*.pdf
+
+# release keystore (decoded from CI secret, never commit)
+keystore/
