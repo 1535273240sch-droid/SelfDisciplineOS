@@ -1,34 +1,37 @@
 package os.aether.discipline.ui
 
 import android.content.Intent
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.MenuBook
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -39,11 +42,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asComposeRenderEffect
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -69,6 +73,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         val repo = (application as AetherApp).repo
         lifecycleScope.launch {
             runCatching {
@@ -82,23 +92,14 @@ class MainActivity : ComponentActivity() {
         setContent {
             val theme by this@MainActivity.uiStore.data.map { it[themeKey] ?: "frost" }.collectAsStateWithLifecycle(initialValue = "frost")
             var voice by remember { mutableStateOf(false) }
-            val scale by animateFloatAsState(if (voice) 0.95f else 1f, aetherSpring(), label = "sheet")
             AetherTheme(theme) {
                 val nav = rememberNavController()
                 Box(Modifier.fillMaxSize()) {
-                    Column(
-                        Modifier.fillMaxSize().graphicsLayer {
-                            scaleX = scale
-                            scaleY = scale
-                            if (voice && android.os.Build.VERSION.SDK_INT >= 31) {
-                                renderEffect = android.graphics.RenderEffect.createBlurEffect(16f, 16f, android.graphics.Shader.TileMode.CLAMP).asComposeRenderEffect()
-                            }
-                        },
-                    ) {
-                        // Inset handling lives here, once: content starts below the status bar, never behind it.
-                        Box(Modifier.weight(1f).statusBarsPadding()) {
+                    // One inset owner for the whole window: status bar, punch-hole, navigation bar, and the keyboard.
+                    Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+                        Box(Modifier.weight(1f)) {
                             NavHost(nav, startDestination = "today", modifier = Modifier.fillMaxSize()) {
-                                composable("today") { BentoToday(repo, nav) }
+                                composable("today") { BentoToday(repo, nav) { voice = true } }
                                 composable("lab") { StudyScreen(repo, nav) }
                                 composable("settings") { Settings(nav) }
                                 composable("driving") { DrivingScreen(repo) }
@@ -107,29 +108,11 @@ class MainActivity : ComponentActivity() {
                                 composable("calisthenics") { CalisthenicsScreen(repo) }
                                 composable("thresholds") { ThresholdScreen(repo) }
                                 composable("backfill") { BackfillScreen(repo) }
-                                composable("providers") { ProviderScreen(repo) }
+                                composable("providers") { ProviderScreen(repo, nav) }
                                 composable("root") { RootScreen(repo) }
                             }
                         }
-                        // The dock is part of the flow, so screens never guess its height.
-                        if (!voice) {
-                            FloatingDock(
-                                nav,
-                                onVoice = { voice = true },
-                                onLock = {
-                                    this@MainActivity.lifecycleScope.launch {
-                                        runCatching {
-                                            val t = repo.loadThresholds()
-                                            if (LockRuntime.mode == LockRuntime.LOCKED || inLockWindow(LocalDateTime.now(), t)) {
-                                                startActivity(Intent(this@MainActivity, LockActivity::class.java))
-                                            } else {
-                                                Toast.makeText(this@MainActivity, "现在不是锁屏时段", Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
-                                    }
-                                },
-                            )
-                        }
+                        if (!voice) FloatingDock(nav) { voice = true }
                     }
                     AnimatedVisibility(
                         visible = voice,
@@ -141,9 +124,16 @@ class MainActivity : ComponentActivity() {
                             targetOffsetY = { it },
                             animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f),
                         ) + fadeOut(tween(140)),
-                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.74f),
+                        modifier = Modifier.fillMaxSize(),
                     ) {
-                        VoiceLayer(repo) { voice = false }
+                        VoiceLayer(
+                            repo,
+                            onClose = { voice = false },
+                            onOpenRouting = {
+                                voice = false
+                                nav.navigate("providers") { launchSingleTop = true }
+                            },
+                        )
                     }
                 }
             }
@@ -152,36 +142,39 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit, onLock: () -> Unit) {
+private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit) {
     val colors = LocalAether.current
-    val current = nav.currentBackStackEntryAsState().value?.destination?.route
-    Box(
-        Modifier
-            .fillMaxWidth()
-            .navigationBarsPadding()
-            .padding(start = 20.dp, end = 20.dp, top = 6.dp, bottom = 16.dp),
-    ) {
-        DockSurface(Modifier.fillMaxWidth().height(58.dp)) {
-            Row(Modifier.fillMaxSize().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                DockItem("今日", "today", current, nav, Modifier.weight(1f), onLock)
-                DockItem("学习", "lab", current, nav, Modifier.weight(1f), onLock)
-                Spacer(Modifier.size(64.dp))
-                DockItem("设置", "settings", current, nav, Modifier.weight(1f), onLock)
-                DockItem("锁屏", "lock", current, nav, Modifier.weight(1f), onLock)
-            }
-        }
-        Box(
-            Modifier
-                .align(Alignment.TopCenter)
-                .offset(y = (-18).dp)
-                .size(64.dp)
-                .clip(CircleShape)
-                .clickable(onClick = onVoice),
-            contentAlignment = Alignment.Center,
-        ) {
-            Canvas(Modifier.size(64.dp)) {
-                drawCircle(androidx.compose.ui.graphics.Brush.radialGradient(listOf(androidx.compose.ui.graphics.Color.White, colors.accent)))
-                drawCircle(colors.accent, radius = 11.dp.toPx())
+    val route = nav.currentBackStackEntryAsState().value?.destination?.route
+    val selected = when (route) {
+        "lab", "driving", "english", "workout", "calisthenics" -> "lab"
+        "settings", "providers", "thresholds", "backfill", "root" -> "settings"
+        else -> "today"
+    }
+    Box(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 4.dp)) {
+        DockSurface(Modifier.fillMaxWidth().height(64.dp)) {
+            Row(Modifier.fillMaxSize().padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                DockItem("今日", selected == "today", Icons.Filled.Home, Modifier.weight(1f)) {
+                    nav.navigate("today") { launchSingleTop = true; popUpTo("today") }
+                }
+                DockItem("学习", selected == "lab", Icons.AutoMirrored.Filled.MenuBook, Modifier.weight(1f)) {
+                    nav.navigate("lab") { launchSingleTop = true; popUpTo("today") }
+                }
+                Column(
+                    Modifier.weight(1f).clickable(onClick = onVoice),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Box(
+                        Modifier.size(32.dp).clip(CircleShape).background(colors.accent),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(Icons.Filled.Mic, contentDescription = "搭档", tint = Color.White, modifier = Modifier.size(18.dp))
+                    }
+                    Text("搭档", color = colors.accent, fontSize = 11.sp)
+                }
+                DockItem("设置", selected == "settings", Icons.Filled.Settings, Modifier.weight(1f)) {
+                    nav.navigate("settings") { launchSingleTop = true; popUpTo("today") }
+                }
             }
         }
     }
@@ -190,21 +183,20 @@ private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit, onLock: ()
 @Composable
 private fun DockItem(
     label: String,
-    route: String,
-    current: String?,
-    nav: NavHostController,
+    selected: Boolean,
+    icon: ImageVector,
     modifier: Modifier,
-    onLock: () -> Unit,
+    onClick: () -> Unit,
 ) {
     val colors = LocalAether.current
-    Box(modifier.clickable {
-        if (route == "lock") {
-            onLock()
-        } else {
-            nav.navigate(route) { launchSingleTop = true; popUpTo("today") }
-        }
-    }, contentAlignment = Alignment.Center) {
-        Text(label, color = if (current == route) colors.accent else colors.textSecondary, fontSize = 12.sp)
+    val tint = if (selected) colors.accent else colors.textSecondary
+    Column(
+        modifier.clickable(onClick = onClick),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(22.dp))
+        Text(label, color = tint, fontSize = 11.sp)
     }
 }
 
@@ -226,7 +218,10 @@ private fun Settings(nav: NavHostController) {
             AccentButton("行情 2×2") { pinWidget(context, os.aether.discipline.widget.CryptoWidgetReceiver::class.java) }
             AccentButton("金句 4×2") { pinWidget(context, os.aether.discipline.widget.QuoteWidgetReceiver::class.java) }
         }
-        GlassCard(Modifier.clickable { nav.navigate("providers") }) { Body("模型路由") }
+        GlassCard(Modifier.clickable { nav.navigate("providers") }) {
+            Body("模型路由")
+            Quiet("AI 是应用的大脑。填好密钥后先测试连接。")
+        }
         GlassCard(Modifier.clickable { nav.navigate("thresholds") }) { Body("数据与阈值") }
         GlassCard(Modifier.clickable { nav.navigate("backfill") }) { Body("补录过去的数据") }
         GlassCard(Modifier.clickable { nav.navigate("root") }) { Body("Root 与锁屏") }
