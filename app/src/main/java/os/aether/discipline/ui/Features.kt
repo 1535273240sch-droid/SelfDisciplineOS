@@ -8,7 +8,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -19,13 +18,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -37,8 +34,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -52,7 +47,6 @@ import os.aether.discipline.content.Phrase
 import os.aether.discipline.content.categoryLabel
 import os.aether.discipline.content.stepOf
 import os.aether.discipline.data.AetherRepository
-import os.aether.discipline.data.SceneBinding
 import os.aether.discipline.data.db.DrivingQuestion
 import os.aether.discipline.domain.SyllabusGaps
 import os.aether.discipline.domain.mealTypeFor
@@ -434,258 +428,6 @@ fun BackfillScreen(repo: AetherRepository) {
                 }
             }
         }
-        if (note.isNotBlank()) Quiet(note)
-    }
-}
-
-@Composable
-fun ProviderScreen(repo: AetherRepository) {
-    val providers by repo.providers.collectAsStateWithLifecycle(emptyList())
-    val scope = rememberCoroutineScope()
-    val colors = LocalAether.current
-    var name by remember { mutableStateOf("") }
-    var base by remember { mutableStateOf("https://api.deepseek.com/v1") }
-    var key by remember { mutableStateOf("") }
-    var path by remember { mutableStateOf("/audio/transcriptions") }
-    var note by remember { mutableStateOf("") }
-    val modelsByProvider = remember { mutableStateMapOf<Long, List<String>>() }
-    val selectedByProvider = remember { mutableStateMapOf<Long, String>() }
-    val errorByProvider = remember { mutableStateMapOf<Long, String>() }
-    val keyEdits = remember { mutableStateMapOf<Long, String>() }
-    val manualByProvider = remember { mutableStateMapOf<Long, String>() }
-    var bindings by remember { mutableStateOf(emptyList<SceneBinding>()) }
-    var bindTarget by remember { mutableStateOf<Pair<Long, String>?>(null) }
-    var bindHint by remember { mutableStateOf("") }
-    val scenes = remember {
-        listOf(
-            "companion" to "搭档",
-            "fast" to "速记",
-            "transcribe" to "转写",
-            "vision" to "视觉",
-            "briefing" to "早报",
-            "tts" to "云端音色",
-        )
-    }
-    val labelOf: (String) -> String = { scene -> scenes.firstOrNull { it.first == scene }?.second ?: scene }
-
-    LaunchedEffect(Unit) { bindings = repo.sceneBindings() }
-
-    ScreenColumn {
-        Quiet("Key 只加密存在这台手机里，不会进源码。")
-        OutlinedTextField(name, { name = it }, label = { Text("渠道名") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(base, { base = it }, label = { Text("Base URL") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(
-            key,
-            { key = it },
-            label = { Text("API Key") },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(path, { path = it }, label = { Text("转写路径覆盖") }, modifier = Modifier.fillMaxWidth())
-        AccentButton("添加") {
-            scope.launch {
-                if (name.isBlank() || base.isBlank() || key.isBlank()) return@launch
-                val id = repo.addProvider(name, base, key, path)
-                key = ""
-                selectedByProvider.remove(id)
-                modelsByProvider.remove(id)
-                errorByProvider.remove(id)
-                note = "已保存 ${name.trim()}，先拉取模型或手动填模型名"
-            }
-        }
-        if (providers.isEmpty()) {
-            Quiet("还没有渠道，先添加 Base URL 与 Key")
-        }
-        providers.forEach { provider ->
-            GlassCard {
-                LaunchedEffect(provider.id) {
-                    if (modelsByProvider[provider.id] == null) {
-                        modelsByProvider[provider.id] = repo.cachedModels(provider.id)
-                    }
-                }
-                val models = modelsByProvider[provider.id].orEmpty()
-                val selected = selectedByProvider[provider.id].orEmpty()
-                Body(provider.providerName)
-                Quiet(provider.baseUrl)
-                Quiet("转写 ${provider.transcriptionPath}")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    AccentButton("拉取模型") {
-                        scope.launch {
-                            errorByProvider.remove(provider.id)
-                            val result = runCatching {
-                                val secret = os.aether.discipline.ai.KeystoreCrypto.decrypt(provider.apiKeyEncrypted)
-                                repo.ai.listModels(provider.baseUrl, secret)
-                            }
-                            result.onSuccess { list ->
-                                modelsByProvider[provider.id] = list
-                                repo.cacheModels(provider.id, list)
-                                if (list.isNotEmpty()) {
-                                    selectedByProvider[provider.id] = list.first()
-                                    bindTarget = provider.id to list.first()
-                                } else {
-                                    selectedByProvider.remove(provider.id)
-                                }
-                                note = "拉到 ${list.size} 个模型"
-                            }.onFailure { failure ->
-                                errorByProvider[provider.id] = failure.message ?: "拉取模型失败"
-                                note = "拉取模型失败"
-                            }
-                        }
-                    }
-                    AccentButton("删除") {
-                        scope.launch {
-                            repo.deleteProvider(provider.id)
-                            modelsByProvider.remove(provider.id)
-                            selectedByProvider.remove(provider.id)
-                            errorByProvider.remove(provider.id)
-                            keyEdits.remove(provider.id)
-                            manualByProvider.remove(provider.id)
-                            if (bindTarget?.first == provider.id) bindTarget = null
-                            bindings = repo.sceneBindings()
-                            bindHint = "已删除 ${provider.providerName}，相关场景绑定已清空"
-                        }
-                    }
-                }
-                val error = errorByProvider[provider.id].orEmpty()
-                if (error.isNotBlank()) {
-                    Text(error, color = colors.danger, fontSize = 11.sp, maxLines = 2)
-                }
-                if (models.isNotEmpty()) {
-                    Quiet("点一个模型选中，最多显示 12 个" + if (models.size > 12) "（共 ${models.size} 个）" else "")
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        models.take(12).chunked(3).forEach { chunk ->
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                chunk.forEach { model ->
-                                    val on = model == selected
-                                    val shape = RoundedCornerShape(50)
-                                    Text(
-                                        model,
-                                        Modifier
-                                            .weight(1f)
-                                            .clip(shape)
-                                            .background(if (on) colors.accentSoft else colors.surfaceStrong)
-                                            .border(0.8.dp, if (on) colors.accent else colors.rimBottom, shape)
-                                            .clickable {
-                                                selectedByProvider[provider.id] = model
-                                                bindTarget = provider.id to model
-                                                bindHint = ""
-                                            }
-                                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                                        color = if (on) colors.accent else colors.textPrimary,
-                                        fontSize = 12.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    Quiet("还没有模型缓存，点“拉取模型”或手动填写。")
-                }
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedTextField(
-                        manualByProvider[provider.id].orEmpty(),
-                        { manualByProvider[provider.id] = it },
-                        label = { Text("或手动填写模型名") },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                    )
-                    AccentButton("使用") {
-                        val typed = manualByProvider[provider.id].orEmpty().trim()
-                        if (typed.isBlank()) {
-                            errorByProvider[provider.id] = "先填写模型名"
-                        } else {
-                            selectedByProvider[provider.id] = typed
-                            bindTarget = provider.id to typed
-                            errorByProvider.remove(provider.id)
-                            bindHint = ""
-                        }
-                    }
-                }
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedTextField(
-                        keyEdits[provider.id].orEmpty(),
-                        { keyEdits[provider.id] = it },
-                        label = { Text("更换 Key") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        modifier = Modifier.weight(1f),
-                    )
-                    AccentButton("更换") {
-                        scope.launch {
-                            val newKey = keyEdits[provider.id].orEmpty().trim()
-                            if (newKey.isBlank()) {
-                                note = "新 Key 不能为空"
-                            } else {
-                                repo.replaceKey(provider.id, newKey)
-                                keyEdits[provider.id] = ""
-                                note = "已更换 ${provider.providerName} 的 Key"
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        GlassCard {
-            Body("场景绑定")
-            Quiet("已绑定 ${bindings.size} / ${scenes.size}")
-            if (bindings.isEmpty()) {
-                Quiet("还没有绑定场景。先选一个模型，再点下面的场景。")
-            } else {
-                bindings.forEach { binding ->
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Quiet(
-                            "${labelOf(binding.scene)} · ${binding.providerName} / ${binding.model}",
-                            Modifier.weight(1f),
-                        )
-                        TextButton(onClick = {
-                            scope.launch {
-                                repo.unbind(binding.scene)
-                                bindings = repo.sceneBindings()
-                                bindHint = "已解绑：${labelOf(binding.scene)}"
-                            }
-                        }) { Text("解绑", color = colors.accent, fontSize = 12.sp) }
-                    }
-                }
-            }
-        }
-        Quiet("点一个场景，绑定当前选中的模型")
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            scenes.chunked(3).forEach { chunk ->
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    chunk.forEach { (scene, label) ->
-                        val bound = bindings.any { it.scene == scene }
-                        AccentButton(if (bound) "$label · 已绑" else label) {
-                            val target = bindTarget
-                            if (target == null) {
-                                bindHint = "先选一个模型"
-                            } else {
-                                scope.launch {
-                                    repo.bind(scene, target.first, target.second)
-                                    bindings = repo.sceneBindings()
-                                    bindHint = "已绑定：$label · ${target.second}"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (bindHint.isNotBlank()) Quiet(bindHint)
         if (note.isNotBlank()) Quiet(note)
     }
 }

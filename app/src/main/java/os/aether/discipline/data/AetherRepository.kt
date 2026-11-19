@@ -39,13 +39,24 @@ import os.aether.discipline.data.db.UnlockEvent
 import os.aether.discipline.data.db.UserThreshold
 import os.aether.discipline.data.db.ViolationRecord
 import os.aether.discipline.data.db.WeightRecord
+import os.aether.discipline.domain.DailyPlan
 import os.aether.discipline.domain.DayInput
 import os.aether.discipline.domain.DefaultWhitelist
 import os.aether.discipline.domain.ExamPhase
 import os.aether.discipline.domain.Facet
+import os.aether.discipline.domain.PlanContext
 import os.aether.discipline.domain.QuestionRef
 import os.aether.discipline.domain.SYSTEM_PROMPT
 import os.aether.discipline.domain.Thresholds
+import os.aether.discipline.domain.chooseModel
+import os.aether.discipline.domain.localFallbackPlan
+import os.aether.discipline.domain.modelTestCopy
+import os.aether.discipline.domain.normalizeApiBase
+import os.aether.discipline.domain.parseDailyPlan
+import os.aether.discipline.domain.planFromJson
+import os.aether.discipline.domain.planToJson
+import os.aether.discipline.domain.sceneLabel
+import os.aether.discipline.domain.scenesToAssign
 import os.aether.discipline.domain.answersMatch
 import os.aether.discipline.domain.buildDailyPaper
 import os.aether.discipline.domain.carriedStreak
@@ -119,6 +130,19 @@ data class TodayUi(
     val fitnessGate: String = "",
     val briefingHead: List<String> = emptyList(),
     val briefingRest: List<String> = emptyList(),
+    val planItems: List<String> = emptyList(),
+    val planNote: String = "",
+    val planSource: String = "",
+    val aiReady: Boolean = false,
+)
+
+data class ModelTestResult(
+    val ok: Boolean,
+    val providerId: Long,
+    val models: List<String>,
+    val chosenModel: String,
+    val message: String,
+    val normalizedBase: String,
 )
 
 data class Bound(val provider: AiProviderConfig, val model: String, val key: String, val path: String)
@@ -595,6 +619,25 @@ class AetherRepository(context: Context) {
                 setHardModule(moduleId)
                 ToolOutcome(true, "已把「${row.title}」设为防断链硬指标")
             }.getOrElse { ToolOutcome(false, "未记录：${it.message ?: "设置失败"}") }
+            "propose_daily_plan" -> {
+                val rawItems = args.opt("items")
+                val items = when (rawItems) {
+                    is JSONArray -> buildList {
+                        for (i in 0 until rawItems.length()) {
+                            val line = rawItems.optString(i).trim().trimStart('-', '•', '·').trim()
+                            if (line.isNotBlank()) add(line)
+                        }
+                    }
+                    is String -> rawItems.lines().map { it.trim().trimStart('-', '•', '·').trim() }.filter { it.isNotEmpty() }
+                    else -> emptyList()
+                }.take(8)
+                if (items.isEmpty()) {
+                    ToolOutcome(false, "未起草：安排是空的")
+                } else {
+                    val note = args.optString("note").trim().take(200)
+                    ToolOutcome(true, "已起草今日安排，等用户采纳", planToJson(DailyPlan(todayString(), items, note, "ai")))
+                }
+            }
             "add_learning_module" -> runCatching {
                 val title = args.optString("title").trim()
                 if (title.isBlank()) error("缺少模块标题")
@@ -647,6 +690,10 @@ class AetherRepository(context: Context) {
         }.orEmpty()
         buildString {
             appendLine("今日 $date ${ui.weekday}。连续自律 ${ui.streak} 天，最长 ${ui.maxStreak} 天。今日状态 ${ui.status}。")
+            if (ui.planItems.isNotEmpty()) {
+                val kind = if (ui.planSource == "ai") "AI" else "本地"
+                appendLine("当前今日计划（$kind）：" + ui.planItems.joinToString("；") + "。" + ui.planNote)
+            }
             appendLine("当前防断链硬指标：${hard.title} ${hard.done}/${hard.target} ${hard.unit}。")
             appendLine("硬项：作息 ${ui.sleepText}；体重/饮食/作息入库 ${if (ui.dataMet) "齐" else "未齐"}。")
             appendLine("锁屏时间：工作日 ${t.weekdayLock.hhmm()} / 周末 ${t.weekendLock.hhmm()}。")
@@ -689,14 +736,153 @@ class AetherRepository(context: Context) {
     }
 
     suspend fun addProvider(name: String, baseUrl: String, apiKey: String, path: String): Long =
-        db.ai().insertProvider(
-            AiProviderConfig(
+        upsertProvider(null, name, baseUrl, apiKey, path)
+
+    suspend fun upsertProvider(id: Long?, name: String, baseUrl: String, apiKey: String, path: String): Long {
+        val normalized = normalizeApiBase(baseUrl)
+        val transcript = path.ifBlank { "/audio/transcriptions" }
+        val existing = id?.let { db.ai().provider(it) }
+        if (existing == null) {
+            if (apiKey.isBlank()) error("先填写 API Key")
+            return db.ai().insertProvider(
+                AiProviderConfig(
+                    providerName = name.trim(),
+                    baseUrl = normalized,
+                    apiKeyEncrypted = KeystoreCrypto.encrypt(apiKey.trim()),
+                    transcriptionPath = transcript,
+                ),
+            )
+        }
+        val encrypted = if (apiKey.isBlank()) existing.apiKeyEncrypted else KeystoreCrypto.encrypt(apiKey.trim())
+        db.ai().updateProvider(
+            existing.copy(
                 providerName = name.trim(),
-                baseUrl = baseUrl.trim(),
-                apiKeyEncrypted = KeystoreCrypto.encrypt(apiKey.trim()),
-                transcriptionPath = path.ifBlank { "/audio/transcriptions" },
+                baseUrl = normalized,
+                apiKeyEncrypted = encrypted,
+                transcriptionPath = transcript,
             ),
         )
+        return existing.id
+    }
+
+    suspend fun testProvider(
+        id: Long?,
+        name: String,
+        baseUrl: String,
+        apiKey: String,
+        path: String,
+        manualModel: String,
+    ): ModelTestResult = withContext(Dispatchers.IO) {
+        val normalized = normalizeApiBase(baseUrl)
+        fun fail(message: String, providerId: Long = id ?: 0, models: List<String> = emptyList()) = ModelTestResult(
+            ok = false,
+            providerId = providerId,
+            models = models,
+            chosenModel = "",
+            message = message,
+            normalizedBase = normalized,
+        )
+        if (name.isBlank()) return@withContext fail("先填写渠道名称")
+        if (normalized.isBlank()) return@withContext fail("先填写 Base URL")
+        val existing = id?.let { db.ai().provider(it) }
+        val typedKey = apiKey.trim()
+        val secret = if (typedKey.isNotBlank()) {
+            typedKey
+        } else if (existing == null) {
+            return@withContext fail("先填写 API Key")
+        } else {
+            when (val plain = KeystoreCrypto.decryptOrNull(existing.apiKeyEncrypted)) {
+                null -> return@withContext fail("密钥无法解密，请重新填写 API Key")
+                "" -> return@withContext fail("先填写 API Key")
+                else -> plain
+            }
+        }
+        val savedId = try {
+            upsertProvider(existing?.id, name, normalized, if (typedKey.isNotBlank()) secret else "", path)
+        } catch (error: Exception) {
+            return@withContext fail(error.message ?: "无法保存密钥")
+        }
+        val fetched = runCatching { ai.listModels(normalized, secret) }
+        val fetchError = fetched.exceptionOrNull()?.message?.trim()?.ifBlank { "拉取模型失败" }
+        val models = fetched.getOrDefault(emptyList())
+        if (fetched.isSuccess) cacheModels(savedId, models)
+        val displayModels = if (fetched.isSuccess) models else cachedModels(savedId)
+        val chosen = chooseModel(manualModel, if (fetched.isSuccess) models else emptyList())
+        val assigned = if (chosen.isBlank()) {
+            emptyList()
+        } else {
+            val owners = sceneBindings().associate { it.scene to it.providerId }
+            scenesToAssign(owners, savedId).onEach { scene -> bind(scene, savedId, chosen) }
+        }
+        val copy = modelTestCopy(fetchError, if (fetched.isSuccess) models.size else 0, chosen, assigned.map { sceneLabel(it) })
+        ModelTestResult(copy.connected, savedId, displayModels, chosen, copy.text, normalized)
+    }
+
+    suspend fun fallbackPlan(): DailyPlan = withContext(Dispatchers.IO) { localFallbackPlan(currentPlanContext()) }
+
+    suspend fun generateTodayPlan(): Pair<DailyPlan, String?> = withContext(Dispatchers.IO) {
+        val ctx = currentPlanContext()
+        val fallback = localFallbackPlan(ctx)
+        val brain = bound("companion")
+            ?: return@withContext fallback to "还没绑定搭档模型。打开模型路由，测试连接后即可生成。"
+        val messages = JSONArray()
+            .put(
+                JSONObject().put("role", "system").put(
+                    "content",
+                    "你是自律搭档。只返回一个 JSON 对象，不要 markdown，不要解释。格式 {\"items\":[\"一条安排\"],\"note\":\"一句提醒\"}。items 4 到 6 条，覆盖训练、硬指标、饮食、入睡。睡眠不足就下调强度，不要把一天塞满。",
+                ),
+            )
+            .put(JSONObject().put("role", "user").put("content", "按我现在的状态排今天。\n" + snapshot()))
+        val result = runCatching { ai.chat(brain.provider.baseUrl, brain.key, brain.model, messages, temperature = 0.4) }
+            .getOrElse { os.aether.discipline.ai.ChatResult("", emptyList(), it.message ?: "网络异常") }
+        if (result.error != null) return@withContext fallback to result.error
+        val parsed = parseDailyPlan(result.content, ctx.date)
+        if (parsed == null || parsed.items.isEmpty()) {
+            return@withContext fallback to "模型没有返回可执行的计划，已先用本地安排。"
+        }
+        val saved = parsed.copy(date = ctx.date, source = "ai")
+        saveTodayPlan(saved)
+        saved to null
+    }
+
+    suspend fun adoptPlan(items: List<String>, note: String, source: String = "ai") {
+        saveTodayPlan(DailyPlan(todayString(), items, note, if (source == "local") "local" else "ai"))
+    }
+
+    private suspend fun saveTodayPlan(plan: DailyPlan) {
+        val items = plan.items.map { it.trim() }.filter { it.isNotEmpty() }.take(8)
+        if (items.isEmpty()) return
+        putRaw(
+            "today_plan",
+            planToJson(plan.copy(date = plan.date.ifBlank { todayString() }, items = items, note = plan.note.trim().take(200))),
+        )
+    }
+
+    private suspend fun loadTodayPlan(): DailyPlan? {
+        val plan = planFromJson(raw("today_plan")) ?: return null
+        if (plan.date != todayString()) return null
+        return plan
+    }
+
+    private suspend fun currentPlanContext(): PlanContext {
+        val thresholds = loadThresholds()
+        val date = LocalDate.now()
+        val key = date.toString()
+        val sleep = db.sleep().get(key)
+        val hard = hardProgress(key, thresholds)
+        val push = db.calisthenics().get("PUSHUP")
+        return PlanContext(
+            date = key,
+            sleepLate = sleep?.isLateSleep == true,
+            hardTitle = hard.title,
+            hardTarget = hard.target,
+            hardUnit = hard.unit,
+            calorieLimit = thresholds.calorieLimit,
+            englishTarget = thresholds.dailyEnglish,
+            lockHHmm = lockTime(date, thresholds).hhmm(),
+            trainingName = push?.let { "俯卧撑 第${it.currentStep}式" } ?: "今日体能",
+        )
+    }
 
     suspend fun replaceKey(id: Long, apiKey: String) {
         val row = db.ai().provider(id) ?: return
@@ -880,7 +1066,9 @@ class AetherRepository(context: Context) {
                 .put(JSONObject().put("role", "system").put("content", "把下面的快讯提纯成 8 到 12 条早报。每条两句：第一句只写核心事实，第二句写一句市场或技术影响。不要娱乐，不要编造没给到的数字。覆盖不到的领域直接说明。"))
                 .put(JSONObject().put("role", "user").put("content", raw))
             val result = ai.chat(bound.provider.baseUrl, bound.key, bound.model, messages, temperature = 0.3)
-            result.content.ifBlank { raw + "\n\n模型没有返回正文。" }
+            result.content.ifBlank {
+                raw + "\n\n模型没有返回正文。" + (result.error?.let { "\n$it" } ?: "")
+            }
         }
         db.briefings().upsert(Briefing(todayString(), System.currentTimeMillis(), body, failed, headlines.size))
         body
@@ -1082,6 +1270,19 @@ class AetherRepository(context: Context) {
         val hours = remain.toHours()
         val mins = remain.toMinutes() % 60
         val next = nextLock(now, t)
+        val shownPlan = loadTodayPlan() ?: localFallbackPlan(
+            PlanContext(
+                date = key,
+                sleepLate = sleep?.isLateSleep == true,
+                hardTitle = hardNow.title,
+                hardTarget = hardNow.target,
+                hardUnit = hardNow.unit,
+                calorieLimit = t.calorieLimit,
+                englishTarget = t.dailyEnglish,
+                lockHHmm = lockTime(date, t).hhmm(),
+                trainingName = push?.let { "俯卧撑 第${it.currentStep}式" } ?: "今日体能",
+            ),
+        )
         return TodayUi(
             date = key,
             weekday = weekdayLabel(date),
@@ -1124,6 +1325,10 @@ class AetherRepository(context: Context) {
             briefingMiss = briefing?.unreachableCount ?: 0,
             briefingHead = briefLines.take(2),
             briefingRest = briefLines.drop(2),
+            planItems = shownPlan.items,
+            planNote = shownPlan.note,
+            planSource = shownPlan.source,
+            aiReady = bound("companion") != null,
             steps = steps,
             englishScene = scene,
             fitnessName = push?.let { "俯卧撑 第${it.currentStep}式" } ?: "俯卧撑",

@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,17 +20,21 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -44,12 +49,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.chrisbanes.haze.HazeStyle
@@ -64,8 +72,11 @@ import org.json.JSONObject
 import os.aether.discipline.ai.ChatResult
 import os.aether.discipline.ai.toolSchema
 import os.aether.discipline.data.AetherRepository
+import os.aether.discipline.data.TodayUi
 import os.aether.discipline.domain.SYSTEM_PROMPT
+import os.aether.discipline.domain.parseDailyPlan
 import os.aether.discipline.domain.parseUtterance
+import os.aether.discipline.domain.planFromJson
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -74,18 +85,20 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
-fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: () -> Unit) {
+fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () -> Unit) {
     val colors = LocalAether.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val messages by repo.messages.collectAsStateWithLifecycle(emptyList())
     var typing by remember { mutableStateOf("") }
-    var showKeys by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf("") }
     var level by remember { mutableFloatStateOf(0f) }
     var warn by remember { mutableStateOf(false) }
     var holding by remember { mutableStateOf(false) }
     var sample by remember { mutableStateOf(false) }
+    var modelName by remember { mutableStateOf<String?>(null) }
+    var today by remember { mutableStateOf(TodayUi()) }
+    var adopted by remember { mutableStateOf("") }
     val submitted = remember { AtomicBoolean(false) }
     val scale by animateFloatAsState(if (holding) 1.08f else 1f, aetherSpring(), label = "mic")
     val recorder = remember {
@@ -95,8 +108,10 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
     }
     val tts = remember { TextToSpeech(context, null) }
     DisposableEffect(Unit) { onDispose { tts.shutdown(); recorder.stop() } }
-    val mic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val micPermit = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     LaunchedEffect(Unit) {
+        modelName = repo.bound("companion")?.model?.ifBlank { null }
+        today = runCatching { repo.today() }.getOrDefault(today)
         val accepted = repo.loadThresholds().let { repo.db.thresholds().get("tts_sample_accepted")?.value == "true" }
         sample = !accepted
         val zh = tts.isLanguageAvailable(Locale.SIMPLIFIED_CHINESE)
@@ -116,45 +131,60 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
             }
         }
     }
-    val sheetShape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
-    val haze = LocalHaze.current
-    val sheetGlass = if (haze != null) {
-        Modifier.hazeEffect(
-            haze,
-            HazeStyle(
-                backgroundColor = colors.surfaceStrong,
-                tints = listOf(HazeTint(colors.surfaceStrong.copy(alpha = 0.92f))),
-                blurRadius = 30.dp,
-                noiseFactor = 0.06f,
-            ),
-        )
-    } else {
-        Modifier.background(colors.surfaceStrong)
+    val chips = buildList {
+        if (today.sleepOk == false) add("昨晚睡眠不足")
+        else if (today.sleepOk == true) add("作息在线")
+        if (!today.inLock && today.countdown.isNotBlank() && today.countdown != "--:--") add("距锁屏 ${today.countdown}")
     }
     Column(
-        modifier
-            .fillMaxWidth()
-            .fillMaxHeight()
-            .clip(sheetShape)
-            .then(sheetGlass)
-            .border(0.8.dp, Brush.verticalGradient(listOf(colors.rimTop, colors.rimBottom)), sheetShape)
-            .navigationBarsPadding()
-            .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 12.dp),
+        Modifier
+            .fillMaxSize()
+            .background(colors.background)
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
     ) {
-        Box(Modifier.fillMaxWidth().padding(bottom = 8.dp), contentAlignment = Alignment.Center) {
-            Box(
-                Modifier
-                    .size(width = 38.dp, height = 4.dp)
-                    .clip(RoundedCornerShape(99.dp))
-                    .background(colors.textSecondary.copy(alpha = 0.35f)),
+        Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "‹",
+                color = colors.textPrimary,
+                fontSize = 26.sp,
+                modifier = Modifier.clickable(onClick = onClose).padding(end = 8.dp, top = 4.dp, bottom = 4.dp),
             )
+            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("搭档", color = colors.textPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                if (modelName.isNullOrBlank()) {
+                    Text(
+                        "未绑定 · 去模型路由",
+                        color = colors.accent,
+                        fontSize = 12.sp,
+                        modifier = Modifier.clickable(onClick = onOpenRouting).padding(top = 2.dp),
+                    )
+                } else {
+                    Text("$modelName · 已连接", color = colors.up, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+                }
+            }
+            Box(Modifier.size(28.dp))
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Quiet("搭档")
-            Text("关闭", color = colors.accent, modifier = Modifier.padding(8.dp).clip(CircleShape).background(colors.surface).padding(8.dp).pointerInput(Unit) { detectTapGestures { onClose() } })
+        if (chips.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                chips.forEach { label ->
+                    Text(
+                        label,
+                        color = colors.textPrimary,
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(99.dp))
+                            .background(colors.surface)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
+                }
+            }
         }
         if (sample) {
-            GlassCard {
+            GlassCard(Modifier.padding(top = 10.dp)) {
                 Body("昨晚的睡眠过了红线。今天把一百道题做完，链就不能断。The gate closes at noon, so we should leave now.")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
                     AccentButton("听一下") {
@@ -169,43 +199,136 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
                 Quiet("选云端时，回复文本会再发给语音服务一次。")
             }
         }
-        LazyColumn(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(
+            Modifier.weight(1f).fillMaxWidth().padding(top = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             items(messages.takeLast(40)) { message ->
-                GlassCard {
-                    Quiet(if (message.role == "USER") "你" else "搭档")
-                    Body(message.textContent)
-                    if (message.widgetPayloadJson != null) AnalyticsBlock(message.widgetPayloadJson)
+                if (message.role == "USER") {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+                        Text(
+                            message.textContent,
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            lineHeight = 22.sp,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(colors.accent)
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                        )
+                    }
+                } else {
+                    val plan = if (message.widgetType == "DAILY_PLAN") {
+                        message.widgetPayloadJson?.let { planFromJson(it) }
+                    } else {
+                        parseDailyPlan(message.textContent, today.date)
+                    }
+                    GlassCard {
+                        val prose = message.textContent.trim()
+                        val jsonOnly = prose.startsWith("{") || prose.startsWith("```")
+                        if (prose.isNotBlank() && !(jsonOnly && plan != null)) Body(prose)
+                        if (plan != null && plan.items.isNotEmpty()) {
+                            plan.items.forEach { line ->
+                                val time = Regex("""^(\d{1,2}[:：]\d{2})\s+(.+)$""").find(line.trim())
+                                if (time != null) {
+                                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Text(time.groupValues[1], color = colors.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.width(58.dp))
+                                        Text(time.groupValues[2], color = colors.textPrimary, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                                    }
+                                } else {
+                                    Body(line)
+                                }
+                            }
+                            if (plan.note.isNotBlank()) Quiet(plan.note, Modifier.padding(top = 4.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.padding(top = 8.dp)) {
+                                Text(
+                                    "采纳这份计划",
+                                    color = colors.accent,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.clickable {
+                                        scope.launch {
+                                            repo.adoptPlan(plan.items, plan.note, plan.source)
+                                            adopted = "已写入今日计划"
+                                            today = repo.today()
+                                        }
+                                    },
+                                )
+                                Text(
+                                    "再调一下",
+                                    color = colors.accent,
+                                    fontSize = 14.sp,
+                                    modifier = Modifier.clickable {
+                                        scope.launch {
+                                            submit(repo, tts, null, "再调一下今天的安排，按我的状态改轻一点，并调用 propose_daily_plan。") { typing = it }
+                                        }
+                                    },
+                                )
+                            }
+                        } else if (message.widgetType == "WEIGHT_SLEEP_CHART") {
+                            message.widgetPayloadJson?.let { AnalyticsBlock(it) }
+                        }
+                    }
                 }
             }
             if (typing.isNotBlank()) item { Quiet(typing) }
         }
         if (warn) Quiet("快到 30 秒了")
-        if (showKeys) {
-            OutlinedTextField(
-                draft,
-                { draft = it },
-                modifier = Modifier.fillMaxWidth(),
+        if (adopted.isNotBlank()) Quiet(adopted)
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .background(colors.surface)
+                .padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BasicTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                modifier = Modifier.weight(1f).padding(vertical = 8.dp),
+                textStyle = TextStyle(color = colors.textPrimary, fontSize = 15.sp),
+                cursorBrush = SolidColor(colors.accent),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                placeholder = { Text("一句话") },
+                keyboardActions = KeyboardActions(onSend = {
+                    val text = draft.trim()
+                    if (text.isNotEmpty()) {
+                        draft = ""
+                        scope.launch { submit(repo, tts, null, text) { typing = it } }
+                    }
+                }),
+                decorationBox = { inner ->
+                    Box {
+                        if (draft.isEmpty()) Quiet("按住说话，或输入一句话")
+                        inner()
+                    }
+                },
             )
-            AccentButton("发送") {
-                val text = draft
-                draft = ""
-                showKeys = false
-                scope.launch { submit(repo, tts, null, text) { typing = it } }
+            if (draft.isNotBlank()) {
+                Text(
+                    "发送",
+                    color = colors.accent,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clickable {
+                        val text = draft.trim()
+                        draft = ""
+                        scope.launch { submit(repo, tts, null, text) { typing = it } }
+                    }.padding(horizontal = 8.dp, vertical = 8.dp),
+                )
             }
-        }
-        Box(Modifier.fillMaxWidth().height(92.dp), contentAlignment = Alignment.Center) {
             Box(
                 Modifier
-                    .size(64.dp)
+                    .padding(4.dp)
+                    .size(40.dp)
                     .scale(scale)
                     .clip(CircleShape)
                     .background(colors.accent.copy(alpha = 0.85f + level.coerceIn(0f, 1f) * 0.15f))
                     .pointerInput(Unit) {
                         detectTapGestures(onPress = {
                             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                                mic.launch(Manifest.permission.RECORD_AUDIO)
+                                micPermit.launch(Manifest.permission.RECORD_AUDIO)
                             } else {
                                 holding = true
                                 warn = false
@@ -221,10 +344,10 @@ fun VoiceLayer(repo: AetherRepository, modifier: Modifier = Modifier, onClose: (
                         })
                     },
             )
-            Text("键盘", modifier = Modifier.align(Alignment.CenterEnd).pointerInput(Unit) { detectTapGestures { showKeys = !showKeys } }, color = colors.textSecondary)
         }
     }
 }
+
 
 private const val BRAIN_RULES = """
 你现在就是这个 App 的操作系统级大脑，可以直接读写本机数据，不需要用户再去别的页面手动操作。
@@ -235,6 +358,7 @@ private const val BRAIN_RULES = """
 - add_learning_module(title, target_value, unit, template_type)：新建阶段模块
 - render_analytics_widget：在对话里画趋势图
 - remember：写入长期记忆
+- propose_daily_plan(items, note)：起草今日安排。不要声称已经写入，用户点采纳后才会进今日计划。睡眠不足就下调训练和题量。
 规则：
 1. 一句话里有多件事就并行调用多个工具；字段不确定就先问一句，不要猜。
 2. 工具返回失败时如实说明原因，绝不能声称已记录。
@@ -278,6 +402,7 @@ private suspend fun submit(
     val toolNames = mutableSetOf<String>()
     val toolNotes = mutableListOf<String>()
     var widget: String? = null
+    var planPayload: String? = null
     var fastError: String? = null
 
     if (fast != null) {
@@ -289,7 +414,9 @@ private suspend fun submit(
         fastError = result.error
         result.tools.forEach { call ->
             val out = repo.executeTool(call.name, call.arguments)
-            if (out.ok) {
+            if (call.name == "propose_daily_plan" && out.payload != null) {
+                planPayload = out.payload
+            } else if (out.ok) {
                 toolNames += call.name
                 toolNotes += out.message
                 if (call.name == "render_analytics_widget") widget = out.payload
@@ -305,13 +432,18 @@ private suspend fun submit(
 
     val companion = repo.bound("companion")
     var reply = ""
+    val askingPlan = listOf("计划", "安排", "排一", "排天", "今天怎么").any { heard.contains(it) }
     if (companion == null) {
         reply = when {
             toolNotes.isNotEmpty() -> "已写入：" + toolNotes.take(3).joinToString("；") + "。先在设置里绑一个搭档模型，我就能接着聊。"
-            fastError != null -> "记录请求失败：" + fastError.orEmpty().take(120)
+            fastError != null -> "记录请求失败：" + fastError.orEmpty().take(160)
+            askingPlan -> "模型还没接上。下面是按本地目标排的底稿，打开模型路由测通后可以按状态重排。"
             local.weight == null && local.sleep == null && local.diet == null && local.calisthenics == null ->
-                "先在设置里绑一个搭档模型。这句话里没有听出体重、作息或饮食。"
+                "先在设置里打开模型路由，绑一个搭档模型。这句话里没有听出体重、作息或饮食。"
             else -> "本地已记，AI 恢复后补全。"
+        }
+        if (askingPlan && planPayload == null) {
+            planPayload = os.aether.discipline.domain.planToJson(repo.fallbackPlan())
         }
     } else {
         onStatus("在想")
@@ -349,7 +481,9 @@ private suspend fun submit(
             messages.put(assistant)
             res.tools.forEach { call ->
                 val out = repo.executeTool(call.name, call.arguments)
-                if (out.ok) {
+                if (call.name == "propose_daily_plan" && out.payload != null) {
+                    planPayload = out.payload
+                } else if (out.ok) {
                     toolNames += call.name
                     toolNotes += out.message
                     if (call.name == "render_analytics_widget") widget = out.payload
@@ -393,8 +527,13 @@ private suspend fun submit(
     }
 
     val wantChart = heard.contains("对比") || heard.contains("趋势") || heard.contains("曲线") || heard.contains("表格")
-    val payload = widget ?: if (wantChart) repo.analyticsPayload(14) else null
-    repo.saveMessage("ASSISTANT", reply, if (payload != null) "WEIGHT_SLEEP_CHART" else null, payload)
+    val chart = widget ?: if (wantChart) repo.analyticsPayload(14) else null
+    val widgetType = when {
+        planPayload != null -> "DAILY_PLAN"
+        chart != null -> "WEIGHT_SLEEP_CHART"
+        else -> null
+    }
+    repo.saveMessage("ASSISTANT", reply, widgetType, planPayload ?: chart)
     onStatus("")
     val source = repo.db.thresholds().get("tts_source")?.value
     if (source == "CLOUD") {

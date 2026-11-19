@@ -11,7 +11,9 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.Alignment
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -221,6 +223,26 @@ fun AccentButton(text: String, onClick: () -> Unit) {
         fontSize = 12.sp,
         fontWeight = FontWeight.SemiBold,
     )
+}
+
+@Composable
+fun PrimaryButton(
+    text: String,
+    modifier: Modifier = Modifier.fillMaxWidth(),
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    val colors = LocalAether.current
+    Box(
+        modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(if (enabled) colors.accent else colors.textSecondary.copy(alpha = 0.35f))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+    }
 }
 
 /** Standard screen container: one scroll column, one horizontal margin, one gap everywhere. */
