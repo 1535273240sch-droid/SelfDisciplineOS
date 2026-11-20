@@ -4,7 +4,6 @@ import android.app.Activity
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
@@ -29,15 +29,24 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Outline
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -63,8 +72,8 @@ data class AetherColors(
     val surfaceStrong = if (dark) Color(0xEB202634) else Color(0xEBFFFFFF)
     val accentSoft = accent.copy(alpha = if (dark) 0.18f else 0.09f)
     val onAccent = if (dark) Color(0xFF101620) else Color.White
-    val rimTop = Color.White.copy(alpha = if (dark) 0.25f else 0.92f)
-    val rimBottom = accent.copy(alpha = if (dark) 0.17f else 0.16f)
+    val rimHighlight = Color.White.copy(alpha = if (dark) 0.52f else 0.98f)
+    val rimShade = if (dark) Color.Black.copy(alpha = 0.44f) else accent.copy(alpha = 0.22f)
     val danger = if (dark) Color(0xFFFFA5A0) else Color(0xFFB3293A)
     val up = if (dark) Color(0xFF8BE8BC) else Color(0xFF16634C)
 }
@@ -180,23 +189,95 @@ internal fun AmbientCanvas(modifier: Modifier, colors: AetherColors) {
     }
 }
 
+internal data class GlassCorners(private val radius: Dp) : Shape {
+    override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
+        val r = minOf(with(density) { radius.toPx() }, size.minDimension / 2)
+        val w = size.width
+        val h = size.height
+        val path = Path().apply {
+            moveTo(r, 0f)
+            lineTo(w - r, 0f)
+            roundedEdge(Offset(w - r, 0f), Offset(r, 0f), Offset(0f, r))
+            lineTo(w, h - r)
+            roundedEdge(Offset(w, h - r), Offset(0f, r), Offset(-r, 0f))
+            lineTo(r, h)
+            roundedEdge(Offset(r, h), Offset(-r, 0f), Offset(0f, -r))
+            lineTo(0f, r)
+            roundedEdge(Offset(0f, r), Offset(0f, -r), Offset(r, 0f))
+            close()
+        }
+        return Outline.Generic(path)
+    }
+}
+
+// Two tangent Bézier sections ease the curve into each straight edge.
+private fun Path.roundedEdge(start: Offset, along: Offset, inward: Offset) {
+    val first = start + along * 0.40f
+    val second = start + along * 0.52f
+    val midpoint = start + along * 0.76f + inward * 0.24f
+    val third = start + along + inward * 0.48f
+    val fourth = start + along + inward * 0.60f
+    val end = start + along + inward
+    cubicTo(first.x, first.y, second.x, second.y, midpoint.x, midpoint.y)
+    cubicTo(third.x, third.y, fourth.x, fourth.y, end.x, end.y)
+}
+
+internal fun Modifier.glassRim(shape: Shape, colors: AetherColors, floating: Boolean) = drawWithCache {
+    val inset = if (floating) 1.8.dp.toPx() else 1.45.dp.toPx()
+    val outline = shape.createOutline(size, layoutDirection, this)
+    val innerSize = Size((size.width - inset * 2).coerceAtLeast(0f), (size.height - inset * 2).coerceAtLeast(0f))
+    val inside = shape.createOutline(innerSize, layoutDirection, this)
+    val edge = Brush.linearGradient(
+        0f to colors.rimHighlight,
+        0.28f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.30f else 0.78f),
+        0.66f to colors.rimShade,
+        0.88f to colors.rimShade,
+        1f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.28f else 0.70f),
+        start = Offset.Zero,
+        end = Offset(size.width * 0.82f, size.height),
+    )
+    val innerEdge = Brush.linearGradient(
+        0f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.26f else 0.70f),
+        0.34f to Color.Transparent,
+        0.67f to Color.Transparent,
+        1f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.17f else 0.48f),
+        start = Offset.Zero,
+        end = Offset(innerSize.width, innerSize.height),
+    )
+    val outerStroke = Stroke(if (floating) 2.3.dp.toPx() else 2.dp.toPx())
+    val innerStroke = Stroke(0.8.dp.toPx())
+    onDrawWithContent {
+        drawContent()
+        drawOutline(outline, edge, style = outerStroke)
+        if (!innerSize.isEmpty()) translate(inset, inset) {
+            drawOutline(inside, innerEdge, style = innerStroke)
+        }
+    }
+}
+
 @Composable
-internal fun Modifier.glassSurface(shape: Shape, floating: Boolean = false): Modifier {
+internal fun Modifier.glassSurface(shape: Shape, floating: Boolean = false, tint: Color? = null): Modifier {
     val colors = LocalAether.current
     val haze = LocalHaze.current
-    val tint = if (floating) colors.surfaceStrong else colors.surface
-    val material = if (haze == null) Modifier.background(tint) else Modifier.hazeEffect(
+    val materialTint = tint ?: if (floating) colors.surfaceStrong else colors.surface
+    val material = if (haze == null) Modifier.background(materialTint) else Modifier.hazeEffect(
         state = haze,
         style = HazeStyle(
             backgroundColor = colors.background,
-            tints = listOf(HazeTint(tint)),
+            tints = listOf(HazeTint(materialTint)),
             blurRadius = if (floating) 30.dp else 20.dp,
             noiseFactor = 0f,
         ),
     )
     return clip(shape).then(material)
-        .background(Brush.verticalGradient(listOf(Color.White.copy(alpha = if (colors.dark) 0.075f else 0.42f), Color.Transparent)))
-        .border(1.dp, Brush.verticalGradient(listOf(colors.rimTop, colors.rimBottom)), shape)
+        .background(
+            Brush.verticalGradient(
+                0f to Color.White.copy(alpha = if (colors.dark) 0.092f else 0.38f),
+                0.36f to Color.Transparent,
+                1f to colors.accent.copy(alpha = if (colors.dark) 0.042f else 0.032f),
+            ),
+        )
+        .glassRim(shape, colors, floating)
 }
 
 @Composable
@@ -206,7 +287,7 @@ fun GlassCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Column(
-        modifier.fillMaxWidth().glassSurface(RoundedCornerShape(24.dp)).padding(padding),
+        modifier.fillMaxWidth().glassSurface(GlassCorners(30.dp)).padding(padding),
         verticalArrangement = Arrangement.spacedBy(if (padding == 0.dp) 0.dp else 6.dp),
         content = content,
     )
@@ -214,7 +295,9 @@ fun GlassCard(
 
 @Composable
 fun DockSurface(modifier: Modifier, content: @Composable BoxScope.() -> Unit) {
-    Box(modifier.glassSurface(RoundedCornerShape(28.dp), floating = true), content = content)
+    val colors = LocalAether.current
+    val tint = colors.surfaceStrong.copy(alpha = if (colors.dark) 0.56f else 0.70f)
+    Box(modifier.glassSurface(CircleShape, floating = true, tint = tint), content = content)
 }
 
 @Composable

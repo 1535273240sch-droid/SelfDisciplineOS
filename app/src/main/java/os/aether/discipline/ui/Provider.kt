@@ -296,7 +296,7 @@ fun ProviderScreen(repo: AetherRepository) {
 @Composable
 private fun Hairline() {
     val colors = LocalAether.current
-    Box(Modifier.fillMaxWidth().height(0.6.dp).background(colors.rimBottom))
+    Box(Modifier.fillMaxWidth().height(0.6.dp).background(colors.textSecondary.copy(alpha = 0.16f)))
 }
 
 @Composable

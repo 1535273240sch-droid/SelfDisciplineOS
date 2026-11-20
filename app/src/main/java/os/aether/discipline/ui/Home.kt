@@ -7,6 +7,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -14,10 +15,12 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -26,13 +29,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -58,6 +64,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -138,7 +148,7 @@ class MainActivity : ComponentActivity() {
                         composable("providers") { ProviderScreen(repo) }
                         composable("root") { RootScreen(repo) }
                     }
-                    if (atRoot) FloatingDock(nav) { voice = true }
+                    if (atRoot) FloatingDock(nav, voice) { voice = true }
                 }
                 AnimatedVisibility(
                     visible = voice,
@@ -166,19 +176,61 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit) {
+private fun FloatingDock(nav: NavHostController, voiceOpen: Boolean, onVoice: () -> Unit) {
+    val colors = LocalAether.current
     val route = nav.currentBackStackEntryAsState().value?.destination?.route
+    val selectedIndex = when {
+        voiceOpen -> 2
+        route == "lab" -> 1
+        route == "settings" -> 3
+        else -> 0
+    }
+    val position by animateFloatAsState(selectedIndex.toFloat(), aetherSpring(), label = "选中项滑动")
     DockSurface(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 4.dp, bottom = 7.dp)) {
-        Row(Modifier.fillMaxWidth().height(58.dp).padding(5.dp).selectableGroup(), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-            DockItem("今日", route == "today", Icons.Filled.Home, Modifier.weight(1f)) {
-                nav.navigate("today") { launchSingleTop = true; popUpTo("today") }
+        BoxWithConstraints(Modifier.fillMaxWidth().height(60.dp)) {
+            val tabWidth = ((maxWidth - 12.dp) / 4).coerceAtLeast(1.dp)
+            Canvas(Modifier.matchParentSize()) {
+                val x = 6.dp.toPx() + tabWidth.toPx() * (position + 0.5f)
+                val center = Offset(x, size.height - 1.dp.toPx())
+                val radius = tabWidth.toPx() * 0.86f
+                val glow = if (colors.dark) colors.accent else colors.glow
+                scale(1f, 0.16f, pivot = center) {
+                    drawCircle(
+                        Brush.radialGradient(
+                            0f to glow.copy(alpha = if (colors.dark) 0.72f else 0.64f),
+                            0.40f to glow.copy(alpha = 0.34f),
+                            1f to glow.copy(alpha = 0f),
+                            center = center,
+                            radius = radius,
+                        ),
+                        radius = radius,
+                        center = center,
+                    )
+                }
             }
-            DockItem("学习", route == "lab", Icons.AutoMirrored.Filled.MenuBook, Modifier.weight(1f)) {
-                nav.navigate("lab") { launchSingleTop = true; popUpTo("today") }
-            }
-            DockItem("搭档", false, Icons.Filled.Mic, Modifier.weight(1f), onVoice)
-            DockItem("设置", route == "settings", Icons.Filled.Settings, Modifier.weight(1f)) {
-                nav.navigate("settings") { launchSingleTop = true; popUpTo("today") }
+            Box(
+                Modifier.offset(x = 6.dp + tabWidth * position).width(tabWidth).fillMaxHeight()
+                    .padding(horizontal = 3.dp, vertical = 6.dp)
+                    .clip(CircleShape)
+                    .background(
+                        Brush.verticalGradient(
+                            0f to Color.White.copy(alpha = if (colors.dark) 0.20f else 0.80f),
+                            1f to colors.accent.copy(alpha = if (colors.dark) 0.14f else 0.075f),
+                        ),
+                    )
+                    .glassRim(CircleShape, colors, floating = false),
+            )
+            Row(Modifier.fillMaxSize().padding(horizontal = 6.dp, vertical = 5.dp).selectableGroup()) {
+                DockItem("今日", selectedIndex == 0, Icons.Filled.Home, Modifier.weight(1f)) {
+                    nav.navigate("today") { launchSingleTop = true; popUpTo("today") }
+                }
+                DockItem("学习", selectedIndex == 1, Icons.AutoMirrored.Filled.MenuBook, Modifier.weight(1f)) {
+                    nav.navigate("lab") { launchSingleTop = true; popUpTo("today") }
+                }
+                DockItem("搭档", selectedIndex == 2, Icons.Filled.Mic, Modifier.weight(1f), onVoice)
+                DockItem("设置", selectedIndex == 3, Icons.Filled.Settings, Modifier.weight(1f)) {
+                    nav.navigate("settings") { launchSingleTop = true; popUpTo("today") }
+                }
             }
         }
     }
@@ -188,11 +240,10 @@ private fun FloatingDock(nav: NavHostController, onVoice: () -> Unit) {
 private fun DockItem(label: String, selected: Boolean, icon: ImageVector, modifier: Modifier, onClick: () -> Unit) {
     val colors = LocalAether.current
     val tint = if (selected) colors.accent else colors.textSecondary
-    val chip = modifier.fillMaxHeight().clip(RoundedCornerShape(22.dp))
+    val chip = modifier.fillMaxHeight().clip(CircleShape)
     Column(
         if (label == "搭档") chip.clickable(role = Role.Button, onClick = onClick)
-        else chip.selectable(selected, role = Role.Tab, onClick = onClick)
-            .then(if (selected) Modifier.background(colors.accentSoft) else Modifier),
+        else chip.selectable(selected, role = Role.Tab, onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
     ) {
@@ -235,10 +286,10 @@ private fun ThemeSettings() {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 pair.forEach { palette ->
                     val selected = current.id == palette.id
-                    val shape = RoundedCornerShape(22.dp)
+                    val shape = GlassCorners(24.dp)
                     Box(
                         Modifier.weight(1f).heightIn(min = 132.dp).clip(shape)
-                            .border(if (selected) 2.dp else 1.dp, if (selected) current.accent else palette.rimTop, shape)
+                            .border(if (selected) 2.dp else 1.dp, if (selected) current.accent else palette.rimHighlight, shape)
                             .selectable(selected, role = Role.RadioButton) {
                                 scope.launch { context.uiStore.edit { it[themeKey] = palette.id } }
                             },

@@ -316,7 +316,7 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
             Modifier
                 .fillMaxWidth()
                 .padding(top = 8.dp)
-                .glassSurface(RoundedCornerShape(24.dp), floating = true)
+                .glassSurface(GlassCorners(25.dp), floating = true)
                 .padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
