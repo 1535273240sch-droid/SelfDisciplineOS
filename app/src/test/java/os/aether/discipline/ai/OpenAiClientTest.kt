@@ -21,7 +21,7 @@ class OpenAiClientTest {
             server.enqueue(chatReply("OK"))
             val base = server.url("/api/v4").toString()
             val client = OpenAiClient()
-            val models = client.listModels(base, "fake-test")
+            val models = client.listModels(listOf(base), "fake-test").models
             assertEquals(86, models.size)
             val selected = models.single { it.endsWith("page") }
             client.verifyModel("companion", base, "fake-test", selected, "")
@@ -44,9 +44,9 @@ class OpenAiClientTest {
             server.enqueue(MockResponse().setBody("""{"data":[]}"""))
             server.enqueue(chatReply("manual works"))
             server.enqueue(MockResponse().setBody("""{"data":{"id":"not-an-array"}}"""))
-            assertTrue(client.listModels(base, "fake").isEmpty())
+            assertTrue(client.listModels(listOf(base), "fake").models.isEmpty())
             client.verifyModel("companion", base, "fake", "manual-id", "")
-            assertThrows(IllegalStateException::class.java) { runBlocking { client.listModels(base, "fake") } }
+            assertThrows(IllegalStateException::class.java) { runBlocking { client.listModels(listOf(base), "fake") } }
             server.takeRequest()
             assertEquals("manual-id", JSONObject(server.takeRequest().body.readUtf8()).getString("model"))
         }
@@ -60,9 +60,9 @@ class OpenAiClientTest {
             val key = "never-display-this-test-token"
             repeat(2) { server.enqueue(MockResponse().setBody("""{"data":[{"id":"same"}],"has_more":true}""")) }
             server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":{"message":"Invalid key $key"}}"""))
-            val cursor = assertThrows(IllegalStateException::class.java) { runBlocking { client.listModels(base, key) } }
+            val cursor = assertThrows(IllegalStateException::class.java) { runBlocking { client.listModels(listOf(base), key) } }
             assertTrue(cursor.message.orEmpty().contains("重复"))
-            val auth = assertThrows(IllegalStateException::class.java) { runBlocking { client.listModels(base, key) } }
+            val auth = assertThrows(IllegalStateException::class.java) { runBlocking { client.listModels(listOf(base), key) } }
             assertTrue(auth.message.orEmpty().contains("401"))
             assertFalse(auth.message.orEmpty().contains(key))
         }
@@ -142,7 +142,7 @@ class OpenAiClientTest {
         try {
             val base = server.url("/v1").toString()
             val failure = runCatching {
-                runBlocking { OpenAiClient().listModels(base, "sk-test") }
+                runBlocking { OpenAiClient().listModels(listOf(base, server.url("/").toString()), "sk-test") }
             }.exceptionOrNull()
             val message = failure?.message.orEmpty()
             assertTrue(message, message.contains("密钥无效"))
@@ -150,6 +150,7 @@ class OpenAiClientTest {
             val request = server.takeRequest()
             assertEquals("/v1/models", request.path)
             assertEquals("Bearer sk-test", request.getHeader("Authorization"))
+            assertEquals(1, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -165,11 +166,51 @@ class OpenAiClientTest {
         )
         server.start()
         try {
-            val models = runBlocking { OpenAiClient().listModels(server.url("/").toString(), "sk-live") }
+            val bases = listOf(server.url("/v1").toString(), server.url("/").toString())
+            val models = runBlocking { OpenAiClient().listModels(bases, "sk-live") }.models
             assertEquals(listOf("alpha", "zeta"), models)
             assertEquals("/v1/models", server.takeRequest().path)
         } finally {
             server.shutdown()
+        }
+    }
+
+    @Test
+    fun listAndChatUseTheSameVersionlessGatewayAfterAMissingV1Endpoint(): Unit = runBlocking {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(404))
+            server.enqueue(MockResponse().setBody("""{"object":"list","data":[{"id":"gateway/chat"}]}"""))
+            server.enqueue(chatReply("OK"))
+
+            val base = server.url("/gateway").toString()
+            val client = OpenAiClient()
+            val catalog = client.listModels(listOf("$base/v1", base), "test-key")
+            assertEquals(base, catalog.baseUrl)
+            client.verifyModel("companion", catalog.baseUrl, "test-key", catalog.models.single(), "")
+
+            assertEquals("/gateway/v1/models", server.takeRequest().path)
+            val listRequest = server.takeRequest()
+            assertEquals("/gateway/models", listRequest.path)
+            assertEquals("application/json", listRequest.getHeader("Accept"))
+            val chat = server.takeRequest()
+            assertEquals("/gateway/chat/completions", chat.path)
+            assertEquals("gateway/chat", JSONObject(chat.body.readUtf8()).getString("model"))
+        }
+    }
+
+    @Test
+    fun gatewayHtmlPageCanFallBackToTheVersionedModelsEndpoint(): Unit = runBlocking {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setBody("<html>Gateway UI</html>"))
+            server.enqueue(MockResponse().setBody("""{"data":[{"id":"gateway-chat"}]}"""))
+            val base = server.url("/proxy").toString()
+
+            val catalog = OpenAiClient().listModels(listOf(base, "$base/v1"), "test-key")
+
+            assertEquals("$base/v1", catalog.baseUrl)
+            assertEquals(listOf("gateway-chat"), catalog.models)
+            assertEquals("/proxy/models", server.takeRequest().path)
+            assertEquals("/proxy/v1/models", server.takeRequest().path)
         }
     }
 

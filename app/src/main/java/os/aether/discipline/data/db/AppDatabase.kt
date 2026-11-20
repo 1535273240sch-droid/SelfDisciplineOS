@@ -6,6 +6,7 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import os.aether.discipline.domain.legacyProviderBase
 
 @Database(
     entities = [
@@ -32,7 +33,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         FinanceQuote::class,
         DesktopWidgetConfig::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -62,6 +63,22 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // Existing providers stored an input URL. Store the effective API root for subsequent calls.
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.query("SELECT id, baseUrl FROM ai_providers").use { rows ->
+                    while (rows.moveToNext()) {
+                        val base = rows.getString(1)
+                        val root = legacyProviderBase(base)
+                        if (root != base) db.execSQL(
+                            "UPDATE ai_providers SET baseUrl = ? WHERE id = ?",
+                            arrayOf<Any>(root, rows.getLong(0)),
+                        )
+                    }
+                }
+            }
+        }
+
         fun get(context: Context): AppDatabase {
             return instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -69,7 +86,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "aether.db",
                 )
-                    .addMigrations(MIGRATION_2_3)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
                     // v1 had no stable schema; v2+ keeps history through explicit migrations.
                     .fallbackToDestructiveMigrationFrom(true, 1)
                     .build()

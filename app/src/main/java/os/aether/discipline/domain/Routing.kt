@@ -11,53 +11,54 @@ import kotlinx.serialization.json.jsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
-/**
- * OpenAI-compatible URL joining.
- *
- * A base of `https://api.deepseek.com/v1` and a base of `https://api.deepseek.com`
- * must both land on `/v1/models` and `/v1/chat/completions`. Bases that already
- * end in `/v4` (Zhipu) keep that version. Pasting a full `/chat/completions`
- * or `/models` URL is stripped back to the API root.
- */
-fun normalizeApiBase(raw: String): String {
-    var base = raw.trim().trim('"', '\'').trim()
-    if (base.isEmpty()) return ""
-    if (!base.startsWith("http://", true) && !base.startsWith("https://", true)) base = "https://$base"
-    base = base.replaceBefore("://", base.substringBefore("://").lowercase())
-    base = base.trimEnd('/')
-    val suffixes = listOf(
-        "/chat/completions",
-        "/completions",
-        "/embeddings",
-        "/models",
-        "/audio/transcriptions",
-        "/audio/speech",
-    )
-    var guard = 0
-    while (guard++ < 4) {
-        val suffix = suffixes.firstOrNull { base.endsWith(it) } ?: break
-        base = base.removeSuffix(suffix).trimEnd('/')
+private val API_VERSION = Regex("""v\d+(?:(?:alpha|beta)\d*)?""")
+private val API_ENDPOINTS = listOf(
+    "/chat/completions", "/completions", "/responses", "/embeddings", "/models",
+    "/audio/transcriptions", "/audio/speech",
+)
+
+private fun providerUrl(raw: String): HttpUrl {
+    val clean = raw.trim().trim('"', '\'').trim()
+    val address = if (clean.contains("://")) clean else "https://$clean"
+    val url = address.toHttpUrlOrNull()
+    require(clean.isNotBlank() && clean.none { it.isWhitespace() || it == '\\' } &&
+        url != null && url.isHttps && url.hasNoCredentials() && url.query == null && url.fragment == null) {
+        "请填写有效的 HTTPS Base URL，密钥填在 API Key 一栏。"
     }
-    return base
+    return url
 }
 
-private val API_VERSION = Regex("""/v\d+$""")
-private val VERSIONED_PATH = Regex("""^/v\d+(/|$)""")
+private fun HttpUrl.endpointSuffix() = API_ENDPOINTS.firstOrNull { encodedPath.trimEnd('/').endsWith(it) }
 
-fun baseHasApiVersion(base: String): Boolean = API_VERSION.containsMatchIn(normalizeApiBase(base))
+private fun HttpUrl.apiRoot(): String {
+    val path = encodedPath.trimEnd('/').removeSuffix(endpointSuffix().orEmpty())
+    return newBuilder().encodedPath(path.ifEmpty { "/" }).build().toString().trimEnd('/')
+}
+
+fun requireProviderBase(raw: String): String = providerUrl(raw).apiRoot()
+
+internal fun providerBaseCandidates(raw: String): List<String> {
+    val url = providerUrl(raw)
+    val base = url.apiRoot()
+    if (url.endpointSuffix() != null || url.pathSegments.any(API_VERSION::matches)) return listOf(base)
+    return if (url.encodedPath == "/") listOf("$base/v1", base) else listOf(base, "$base/v1")
+}
+
+internal fun legacyProviderBase(base: String): String {
+    val url = base.toHttpUrlOrNull() ?: return base
+    val root = url.apiRoot()
+    return if (Regex("""/v\d+$""").containsMatchIn(root)) root else "$root/v1"
+}
 
 fun endpointUrl(base: String, path: String): String {
     val given = path.trim()
     if (given.startsWith("http://") || given.startsWith("https://")) return given
-    val root = normalizeApiBase(base)
+    val root = base.trimEnd('/')
     if (root.isEmpty()) return given
     var relative = if (given.startsWith("/")) given else "/$given"
-    if (baseHasApiVersion(root) && (relative.startsWith("/v1/") || relative == "/v1")) {
-        relative = relative.removePrefix("/v1").ifBlank { "/" }
-        if (!relative.startsWith("/")) relative = "/$relative"
-    }
-    if (!baseHasApiVersion(root) && !VERSIONED_PATH.containsMatchIn(relative)) {
-        relative = "/v1$relative"
+    val lastSegment = root.toHttpUrlOrNull()?.pathSegments?.lastOrNull()
+    if (lastSegment != null && API_VERSION.matches(lastSegment) && relative.startsWith("/v1/")) {
+        relative = relative.removePrefix("/v1")
     }
     return root + relative
 }
@@ -65,15 +66,6 @@ fun endpointUrl(base: String, path: String): String {
 fun modelsUrl(base: String): String = endpointUrl(base, "/models")
 
 fun chatCompletionsUrl(base: String): String = endpointUrl(base, "/chat/completions")
-
-fun requireProviderBase(raw: String): String {
-    val clean = raw.trim().trim('"', '\'').trim()
-    val url = normalizeApiBase(clean).toHttpUrlOrNull()
-    require(clean.isNotBlank() && (!clean.contains("://") || clean.startsWith("https://", true)) &&
-        clean.none { it.isWhitespace() || it == '\\' } && url != null && url.isHttps && url.hasNoCredentials() &&
-        url.query == null && url.fragment == null) { "请填写有效的 HTTPS Base URL，密钥填在 API Key 一栏。" }
-    return url.toString().trimEnd('/')
-}
 
 fun sameApiOrigin(first: String, second: String): Boolean {
     val a = first.toHttpUrlOrNull() ?: return false
@@ -110,7 +102,7 @@ fun readableApiError(code: Int, body: String): String {
     val detail = extractApiMessage(body)
     val why = when (code) {
         401, 403 -> "密钥无效或没有权限"
-        404 -> "接口地址不对。Base URL 若已包含 /v1，不要再叠一层"
+        404, 405 -> "接口或模型不可用，请核对服务商的 OpenAI 兼容地址和模型 ID"
         408 -> "连接超时"
         429 -> "请求过于频繁或额度不足"
         in 500..599 -> "服务商暂时不可用"
@@ -140,16 +132,15 @@ private val jsonParser = Json { ignoreUnknownKeys = true; isLenient = true }
 
 internal data class ModelPage(val ids: List<String>, val nextCursor: String?)
 
-internal fun parseModelPage(body: String): ModelPage {
-    val root = runCatching { jsonParser.parseToJsonElement(body) }.getOrNull() as? JsonObject
-    val data = root?.get("data") as? JsonArray
-        ?: error("模型列表接口未返回有效的 data 数组，可改用手填模型后测试。")
+internal fun parseModelPage(body: String): ModelPage? {
+    val root = runCatching { jsonParser.parseToJsonElement(body) }.getOrNull() as? JsonObject ?: return null
+    val data = root["data"] as? JsonArray ?: return null
     val ids = data.mapNotNull { element ->
         val id = (element as? JsonObject)?.get("id") as? JsonPrimitive
         id?.takeIf { it.isString }?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
     }
     require(data.isEmpty() || ids.isNotEmpty()) { "模型列表里没有有效的模型 ID。" }
-    val next = if ((root?.get("has_more") as? JsonPrimitive)?.booleanOrNull == true) {
+    val next = if ((root["has_more"] as? JsonPrimitive)?.booleanOrNull == true) {
         (root["last_id"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotBlank)
             ?: ids.lastOrNull() ?: error("模型列表标记还有下一页，但缺少分页游标。")
     } else null

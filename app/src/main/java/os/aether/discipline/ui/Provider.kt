@@ -49,13 +49,13 @@ import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import os.aether.discipline.ai.ModelCatalog
 import os.aether.discipline.data.AetherRepository
 import os.aether.discipline.data.ProviderDraft
 import os.aether.discipline.data.SceneBinding
 import os.aether.discipline.data.db.AiProviderConfig
 import os.aether.discipline.domain.MODEL_SCENES
 import os.aether.discipline.domain.describeTransportFailure
-import os.aether.discipline.domain.requireProviderBase
 import os.aether.discipline.domain.sceneLabel
 import java.io.IOException
 
@@ -66,13 +66,13 @@ fun ProviderScreen(repo: AetherRepository) {
     val colors = LocalAether.current
     var editingId by remember { mutableStateOf<Long?>(null) }
     var initialized by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf("DeepSeek") }
-    var base by remember { mutableStateOf("https://api.deepseek.com/v1") }
+    var name by remember { mutableStateOf("") }
+    var base by remember { mutableStateOf("") }
     var key by remember { mutableStateOf("") }
     var path by remember { mutableStateOf("/audio/transcriptions") }
     var model by remember { mutableStateOf("") }
     var models by remember { mutableStateOf(emptyList<String>()) }
-    var fetched by remember { mutableStateOf<List<String>?>(null) }
+    var fetched by remember { mutableStateOf<ModelCatalog?>(null) }
     var reveal by remember { mutableStateOf(false) }
     var showModels by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -119,6 +119,17 @@ fun ProviderScreen(repo: AetherRepository) {
     fun invalidateCatalog() {
         fetched = null
         models = emptyList()
+        feedback = ""
+    }
+
+    fun test() {
+        val form = draft()
+        val selected = model.trim()
+        val catalog = fetched
+        perform("正在测试模型…") {
+            repo.testModel(form, selected, catalog)
+            feedback = "$selected 已成功返回回复。"
+        }
     }
 
     fun activate(scene: String) {
@@ -127,12 +138,14 @@ fun ProviderScreen(repo: AetherRepository) {
         val selected = model
         val catalog = fetched
         perform("正在测试$label…") {
-            editingId = repo.activateModel(form, scene, selected, catalog)
-            base = requireProviderBase(form.baseUrl)
+            val provider = repo.activateModel(form, scene, selected, catalog)
+            editingId = provider.id
+            name = provider.providerName
+            base = provider.baseUrl
             key = ""
             reveal = false
             bindings = repo.sceneBindings()
-            models = editingId?.let { repo.cachedModels(it) }.orEmpty()
+            models = repo.cachedModels(provider.id)
             feedback = "已测试并启用$label · ${selected.trim()}"
         }
     }
@@ -148,7 +161,7 @@ fun ProviderScreen(repo: AetherRepository) {
 
     val idle = pending == null
     ScreenColumn {
-        PageTitle("模型接入", "拉取模型 → 选择模型 → 测试并绑定")
+        PageTitle("模型接入", "OpenAI 兼容接口")
         if (providers.isNotEmpty()) {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                 items(providers, key = { it.id }) { provider ->
@@ -169,13 +182,13 @@ fun ProviderScreen(repo: AetherRepository) {
             }
         }
         GlassCard(padding = 0.dp) {
-            FieldRow("渠道名称", name, { name = it }, "例如 DeepSeek", idle)
+            FieldRow("渠道名称", name, { name = it }, "可选，默认用域名", idle)
             Hairline()
-            FieldRow("Base URL", base, { base = it; invalidateCatalog() }, "https://api.deepseek.com/v1", idle, KeyboardType.Uri)
+            FieldRow("Base URL", base, { base = it; invalidateCatalog() }, "https://api.openai.com/v1", idle, KeyboardType.Uri)
             Hairline()
             FieldRow(
                 "API Key", key, { key = it; invalidateCatalog() },
-                if (editingId == null) "粘贴密钥" else "已保存，留空沿用", idle, KeyboardType.Password,
+                if (editingId == null) "粘贴模型服务商的密钥" else "已保存，留空沿用", idle, KeyboardType.Password,
                 masked = !reveal,
                 trailing = {
                     IconButton(onClick = { reveal = !reveal }, enabled = idle) {
@@ -189,29 +202,32 @@ fun ProviderScreen(repo: AetherRepository) {
             Hairline()
             FieldRow("转写路径", path, { path = it }, "/audio/transcriptions", idle, KeyboardType.Uri)
         }
-        PrimaryButton("一键拉取模型", enabled = idle) {
+        PrimaryButton("一键拉取模型", enabled = idle && base.isNotBlank()) {
             val form = draft()
             perform("正在拉取模型列表…") {
                 val catalog = repo.discoverModels(form)
                 base = catalog.baseUrl
                 models = catalog.models
-                fetched = catalog.models
+                fetched = catalog
                 showModels = models.isNotEmpty()
-                feedback = if (models.isEmpty()) "接口返回 0 个模型。可手填模型名后测试。" else "已拉取全部 ${models.size} 个模型。选择后测试启用。"
+                feedback = if (models.isEmpty()) "接口返回 0 个模型，可以手填模型 ID 后测试。" else "已拉取 ${models.size} 个模型。"
             }
         }
         GlassCard {
             SectionTitle("选择模型")
             OutlinedTextField(
-                model, { model = it }, label = { Text("模型 ID") },
+                model, { model = it; feedback = "" }, label = { Text("模型 ID") },
                 placeholder = { Text("从列表选择或手动填写") },
                 enabled = idle, singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
             if (models.isNotEmpty()) {
                 TextButton(enabled = idle, onClick = { showModels = true }) { Text("查看全部 ${models.size} 个模型") }
             }
-            PrimaryButton("测试并启用搭档", enabled = idle && model.isNotBlank()) { activate("companion") }
-            Quiet("测试成功后加密保存渠道与绑定。")
+            PrimaryButton("测试模型", enabled = idle && base.isNotBlank() && model.isNotBlank()) { test() }
+            TextButton(enabled = idle && base.isNotBlank() && model.isNotBlank(), onClick = { activate("companion") }) {
+                Text("测试并启用搭档")
+            }
+            Quiet("测试模型会发送一条示例消息。启用后才保存渠道和绑定。")
         }
         val status = pending ?: feedback.takeIf(String::isNotBlank)
         if (status != null) {
@@ -234,7 +250,7 @@ fun ProviderScreen(repo: AetherRepository) {
                         Body(sceneLabel(scene))
                         Quiet(binding?.let { "${it.providerName} · ${it.model}" } ?: "未绑定")
                     }
-                    TextButton(enabled = idle && model.isNotBlank(), onClick = { activate(scene) }) { Text("测试并绑定") }
+                    TextButton(enabled = idle && base.isNotBlank() && model.isNotBlank(), onClick = { activate(scene) }) { Text("测试并绑定") }
                     if (binding != null) {
                         TextButton(enabled = idle, onClick = {
                             perform("正在解绑…") {
@@ -255,6 +271,7 @@ fun ProviderScreen(repo: AetherRepository) {
     if (showModels) {
         ModelPicker(models, model, onDismiss = { showModels = false }) {
             model = it
+            feedback = ""
             showModels = false
         }
     }

@@ -20,9 +20,8 @@ import org.json.JSONObject
 import os.aether.discipline.domain.audioEndpoint
 import os.aether.discipline.domain.chatCompletionsUrl
 import os.aether.discipline.domain.describeTransportFailure
-import os.aether.discipline.domain.endpointUrl
 import os.aether.discipline.domain.extractApiMessage
-import os.aether.discipline.domain.modelsUrl as resolvedModelsUrl
+import os.aether.discipline.domain.modelsUrl
 import os.aether.discipline.domain.parseModelPage
 import os.aether.discipline.domain.readableApiError
 import java.io.File
@@ -38,6 +37,10 @@ data class ChatResult(val content: String, val tools: List<ToolCall>, val error:
 
 data class StreamResult(val text: String, val error: String? = null)
 
+internal data class ModelCatalog(val baseUrl: String, val models: List<String>)
+
+private class ModelEndpointMismatch(message: String) : IllegalStateException(message)
+
 class OpenAiClient {
     private val http = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -51,8 +54,20 @@ class OpenAiClient {
         .callTimeout(35, TimeUnit.SECONDS)
         .build()
 
-    suspend fun listModels(baseUrl: String, apiKey: String): List<String> {
+    internal suspend fun listModels(bases: List<String>, apiKey: String): ModelCatalog {
         require(apiKey.isNotBlank()) { "先填写 API Key" }
+        for (base in bases.dropLast(1)) {
+            try {
+                return ModelCatalog(base, fetchModelPages(base, apiKey))
+            } catch (_: ModelEndpointMismatch) {
+                // A gateway may expose /models directly or under /v1 on the same origin.
+            }
+        }
+        val base = bases.last()
+        return ModelCatalog(base, fetchModelPages(base, apiKey))
+    }
+
+    private suspend fun fetchModelPages(baseUrl: String, apiKey: String): List<String> {
         val endpoint = modelsUrl(baseUrl).toHttpUrl()
         val models = linkedSetOf<String>()
         val cursors = hashSetOf<String>()
@@ -60,10 +75,21 @@ class OpenAiClient {
         do {
             val cursor = after
             val url = if (cursor == null) endpoint else endpoint.newBuilder().addQueryParameter("after", cursor).build()
-            val request = Request.Builder().url(url).header("Authorization", bearer(apiKey)).get().build()
+            val request = Request.Builder().url(url)
+                .header("Authorization", bearer(apiKey))
+                .header("Accept", "application/json")
+                .get().build()
             val (code, text) = execute(listHttp, request) { it.code to it.body?.string().orEmpty() }
-            if (code !in 200..299) error(apiError(code, text, apiKey))
-            val page = parseModelPage(text)
+            if (code !in 200..299) {
+                val detail = apiError(code, text, apiKey)
+                if (cursor == null && (code == 404 || code == 405)) throw ModelEndpointMismatch(detail)
+                error(detail)
+            }
+            val page = parseModelPage(text) ?: run {
+                val detail = "模型列表未返回 OpenAI 格式的 data 数组，可以手填模型 ID 后测试。"
+                if (cursor == null) throw ModelEndpointMismatch(detail)
+                error(detail)
+            }
             models.addAll(page.ids)
             after = page.nextCursor
             check(after == null || cursors.add(after)) { "服务商返回了重复的分页游标，模型列表未完整拉取。" }
@@ -269,10 +295,6 @@ class OpenAiClient {
         internal val WAV = "audio/wav".toMediaType()
 
         fun bearer(key: String) = "Bearer $key"
-
-        fun joinUrl(base: String, path: String): String = endpointUrl(base, path)
-
-        fun modelsUrl(base: String): String = resolvedModelsUrl(base)
     }
 }
 

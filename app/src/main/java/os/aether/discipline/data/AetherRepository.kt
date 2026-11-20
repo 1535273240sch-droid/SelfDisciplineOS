@@ -14,9 +14,11 @@ import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
 import os.aether.discipline.ai.KeystoreCrypto
+import os.aether.discipline.ai.ModelCatalog
 import os.aether.discipline.ai.OpenAiClient
 import os.aether.discipline.ai.verifyModel
 import os.aether.discipline.content.Phrase
@@ -60,6 +62,7 @@ import os.aether.discipline.domain.Thresholds
 import os.aether.discipline.domain.MODEL_SCENES
 import os.aether.discipline.domain.audioEndpoint
 import os.aether.discipline.domain.localFallbackPlan
+import os.aether.discipline.domain.providerBaseCandidates
 import os.aether.discipline.domain.requireProviderBase
 import os.aether.discipline.domain.sameApiOrigin
 import os.aether.discipline.domain.parseDailyPlan
@@ -155,9 +158,17 @@ internal class ProviderDraft(
     val transcriptionPath: String,
 )
 
-internal data class ProviderCatalog(val models: List<String>, val baseUrl: String)
+private class ProviderConnection(
+    val previous: AiProviderConfig?,
+    val name: String,
+    val bases: List<String>,
+    val key: String,
+    val path: String,
+) {
+    val base get() = bases.first()
+}
 
-private class ProviderConnection(val previous: AiProviderConfig?, val name: String, val base: String, val key: String, val path: String)
+private val BEARER_PREFIX = Regex("""^Bearer[ \t]+""", RegexOption.IGNORE_CASE)
 
 data class Bound(val provider: AiProviderConfig, val model: String, val key: String, val path: String)
 
@@ -769,18 +780,26 @@ class AetherRepository(context: Context) {
         JSONObject().put("rows", rows).put("note", "折线为体重，柱形为热量，红点标记作息越线。").toString()
     }
 
-    internal suspend fun discoverModels(draft: ProviderDraft): ProviderCatalog = withContext(Dispatchers.IO) {
+    internal suspend fun discoverModels(draft: ProviderDraft): ModelCatalog = withContext(Dispatchers.IO) {
         val connection = prepareProvider(draft)
-        ProviderCatalog(ai.listModels(connection.base, connection.key), connection.base)
+        ai.listModels(connection.bases, connection.key)
+    }
+
+    internal suspend fun testModel(draft: ProviderDraft, selection: String, catalog: ModelCatalog?) =
+        withContext(Dispatchers.IO) {
+            require(selection.isNotBlank()) { "请先选择或填写模型 ID。" }
+            val connection = prepareProvider(draft, catalog?.baseUrl)
+            ai.verifyModel("companion", connection.base, connection.key, selection.trim(), connection.path)
     }
 
     internal suspend fun activateModel(
-        draft: ProviderDraft, scene: String, selection: String, catalog: List<String>?,
-    ): Long = withContext(Dispatchers.IO) {
+        draft: ProviderDraft, scene: String, selection: String, catalog: ModelCatalog?,
+    ): AiProviderConfig = withContext(Dispatchers.IO) {
         require(scene in MODEL_SCENES) { "未知模型场景" }
         val model = selection.trim()
         require(model.isNotEmpty()) { "请先选择或填写模型名。" }
-        val connection = prepareProvider(draft)
+        val connection = prepareProvider(draft, catalog?.baseUrl)
+        audioEndpoint(connection.base, connection.path)
         val previous = connection.previous
         val changedKey = draft.apiKey.isNotBlank() && previous != null &&
             KeystoreCrypto.decryptOrNull(previous.apiKeyEncrypted) != connection.key
@@ -815,7 +834,7 @@ class AetherRepository(context: Context) {
             val encrypted = if (suppliedKey || previous == null) KeystoreCrypto.encrypt(connection.key) else previous.apiKeyEncrypted
             val oldCache = previous?.cachedModelsJson.orEmpty().ifBlank { "[]" }
             val cache = when {
-                catalog != null -> JSONArray(catalog).toString()
+                catalog != null -> JSONArray(catalog.models).toString()
                 connection.base == previous?.baseUrl && !suppliedKey -> oldCache
                 else -> "[]"
             }
@@ -833,27 +852,33 @@ class AetherRepository(context: Context) {
             }
             putRaw("scene_${scene}_provider", id.toString())
             putRaw("scene_${scene}_model", model)
-            id
+            provider.copy(id = id)
         }
     }
 
-    private suspend fun prepareProvider(draft: ProviderDraft): ProviderConnection {
-        val name = draft.name.trim()
-        require(name.isNotEmpty()) { "请填写渠道名称。" }
-        val base = requireProviderBase(draft.baseUrl)
+    private suspend fun prepareProvider(draft: ProviderDraft, discoveredBase: String? = null): ProviderConnection {
+        val candidates = providerBaseCandidates(draft.baseUrl)
         val path = draft.transcriptionPath.trim().ifBlank { "/audio/transcriptions" }
-        audioEndpoint(base, path)
         val previous = draft.id?.let { db.ai().provider(it) ?: error("渠道已删除，请新建渠道。") }
-        val key = draft.apiKey.trim().ifBlank {
+        val preferredBase = discoveredBase ?: previous?.baseUrl
+        val bases = if (preferredBase != null && preferredBase in candidates) {
+            listOf(preferredBase) + candidates.filterNot { it == preferredBase }
+        } else candidates
+        val base = bases.first()
+        val name = draft.name.trim().ifBlank { base.toHttpUrl().host }
+        val key = BEARER_PREFIX.replaceFirst(draft.apiKey.trimStart(), "").trim()
+        val resolvedKey = if (draft.apiKey.isBlank()) {
             require(previous != null) { "请填写 API Key。" }
             require(sameApiOrigin(requireProviderBase(previous.baseUrl), base)) {
                 "渠道地址已变更，请重新填写该地址的 API Key。"
             }
             KeystoreCrypto.decryptOrNull(previous.apiKeyEncrypted)
                 ?.takeIf(String::isNotBlank) ?: error("本机无法解密已保存的密钥，请重新填写 API Key。")
+        } else key
+        require(resolvedKey.isNotBlank() && resolvedKey.all { it in '!'..'~' }) {
+            "API Key 应为单行，不能含空格或换行。"
         }
-        require(key.all { it in '!'..'~' }) { "API Key 应为单行，不能含空格或换行。" }
-        return ProviderConnection(previous, name, base, key, path)
+        return ProviderConnection(previous, name, bases, resolvedKey, path)
     }
 
 

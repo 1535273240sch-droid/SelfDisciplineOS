@@ -14,10 +14,10 @@ class RoutingTest {
         val bare = "https://api.deepseek.com"
         val sloppy = "https://api.deepseek.com/v1/"
         assertEquals("https://api.deepseek.com/v1/models", modelsUrl(withVersion))
-        assertEquals("https://api.deepseek.com/v1/models", modelsUrl(bare))
+        assertEquals("https://api.deepseek.com/v1/models", modelsUrl(providerBaseCandidates(bare).first()))
         assertEquals("https://api.deepseek.com/v1/models", modelsUrl(sloppy))
         assertEquals("https://api.deepseek.com/v1/chat/completions", chatCompletionsUrl(withVersion))
-        assertEquals("https://api.deepseek.com/v1/chat/completions", chatCompletionsUrl(bare))
+        assertEquals("https://api.deepseek.com/v1/chat/completions", chatCompletionsUrl(providerBaseCandidates(bare).first()))
         assertEquals("https://api.deepseek.com/v1/chat/completions", chatCompletionsUrl(sloppy))
     }
 
@@ -25,16 +25,30 @@ class RoutingTest {
     fun pastedEndpointAndMissingSchemeAreNormalized() {
         assertEquals(
             "https://api.deepseek.com/v1/models",
-            modelsUrl("https://api.deepseek.com/v1/chat/completions"),
+            modelsUrl(requireProviderBase("https://api.deepseek.com/v1/chat/completions")),
         )
         assertEquals(
             "https://api.deepseek.com/v1/models",
-            modelsUrl("  api.deepseek.com/v1/models  "),
+            modelsUrl(requireProviderBase("  api.deepseek.com/v1/models  ")),
         )
         assertEquals(
             "https://api.groq.com/openai/v1/chat/completions",
             chatCompletionsUrl("https://api.groq.com/openai/v1/"),
         )
+    }
+
+    @Test
+    fun gatewayPathsKeepTheirPrefixAndTryV1OnlyWhenTheRootIsAmbiguous() {
+        val host = "https://example.com"
+        assertEquals(listOf("$host/v1", host), providerBaseCandidates(host))
+        assertEquals(listOf("$host/gateway", "$host/gateway/v1"), providerBaseCandidates("$host/gateway/"))
+        assertEquals(listOf("$host/gateway"), providerBaseCandidates("$host/gateway/chat/completions"))
+        assertEquals(listOf(host), providerBaseCandidates("$host/models"))
+        assertEquals(listOf("$host/v1beta/openai"), providerBaseCandidates("$host/v1beta/openai/"))
+        assertEquals("$host/v1beta/openai/models", modelsUrl("$host/v1beta/openai"))
+        assertEquals("$host/gateway/v1", legacyProviderBase("$host/gateway"))
+        assertEquals("$host/v1", legacyProviderBase(host))
+        assertEquals("$host/api/v4", legacyProviderBase("$host/api/v4"))
     }
 
     @Test
@@ -71,7 +85,7 @@ class RoutingTest {
         val text = readableApiError(401, body)
         assertTrue(text.contains("密钥无效或没有权限"))
         assertTrue(text.contains("Authentication Fails"))
-        assertTrue(readableApiError(404, "").contains("不要再叠一层"))
+        assertTrue(readableApiError(404, "").contains("OpenAI 兼容地址"))
         assertTrue(readableApiError(500, "").contains("HTTP 500"))
         assertTrue(describeTransportFailure(IllegalStateException("timeout")).contains("连接超时"))
         assertTrue(describeTransportFailure(IllegalStateException("Cleartext HTTP traffic not permitted")).contains("明文"))
@@ -82,8 +96,8 @@ class RoutingTest {
         val body = """
             {"data":[{"id":"deepseek-reasoner"},{"id":""},{"id":"deepseek-chat"},{"id":"deepseek-chat"}]}
         """.trimIndent()
-        assertEquals(listOf("deepseek-reasoner", "deepseek-chat", "deepseek-chat"), parseModelPage(body).ids)
-        assertThrows(IllegalStateException::class.java) { parseModelPage("not-json") }
+        assertEquals(listOf("deepseek-reasoner", "deepseek-chat", "deepseek-chat"), parseModelPage(body)?.ids)
+        assertNull(parseModelPage("not-json"))
     }
 
     @Test
