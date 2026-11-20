@@ -1,29 +1,36 @@
 package os.aether.discipline.ai
 
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import org.json.JSONArray
 import org.json.JSONObject
+import os.aether.discipline.domain.audioEndpoint
 import os.aether.discipline.domain.chatCompletionsUrl
 import os.aether.discipline.domain.describeTransportFailure
 import os.aether.discipline.domain.endpointUrl
 import os.aether.discipline.domain.extractApiMessage
 import os.aether.discipline.domain.modelsUrl as resolvedModelsUrl
-import os.aether.discipline.domain.parseModelIds
+import os.aether.discipline.domain.parseModelPage
 import os.aether.discipline.domain.readableApiError
 import java.io.File
+import java.io.IOException
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 data class ToolCall(val id: String, val name: String, val arguments: String)
 
@@ -36,6 +43,7 @@ class OpenAiClient {
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(90, TimeUnit.SECONDS)
+        .followRedirects(false)
         .build()
 
     private val listHttp = http.newBuilder()
@@ -43,21 +51,24 @@ class OpenAiClient {
         .callTimeout(35, TimeUnit.SECONDS)
         .build()
 
-    suspend fun listModels(baseUrl: String, apiKey: String): List<String> = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) throw IllegalStateException("先填写 API Key")
-        val url = modelsUrl(baseUrl)
-        val (code, text) = try {
-            execute(listHttp, Request.Builder().url(url).header("Authorization", bearer(apiKey)).get().build())
-        } catch (error: Exception) {
-            if (error is IllegalStateException && error.message?.startsWith("先填写") == true) throw error
-            throw IllegalStateException(describeTransportFailure(error) + "\n请求 $url", error)
-        }
-        if (code !in 200..299) throw IllegalStateException(readableApiError(code, text) + "\n请求 $url")
-        val models = parseModelIds(text)
-        if (models.isEmpty() && text.isNotBlank() && !text.contains("\"data\"")) {
-            throw IllegalStateException("已连通，但响应里没有模型列表。\n请求 $url")
-        }
-        models
+    suspend fun listModels(baseUrl: String, apiKey: String): List<String> {
+        require(apiKey.isNotBlank()) { "先填写 API Key" }
+        val endpoint = modelsUrl(baseUrl).toHttpUrl()
+        val models = linkedSetOf<String>()
+        val cursors = hashSetOf<String>()
+        var after: String? = null
+        do {
+            val cursor = after
+            val url = if (cursor == null) endpoint else endpoint.newBuilder().addQueryParameter("after", cursor).build()
+            val request = Request.Builder().url(url).header("Authorization", bearer(apiKey)).get().build()
+            val (code, text) = execute(listHttp, request) { it.code to it.body?.string().orEmpty() }
+            if (code !in 200..299) error(apiError(code, text, apiKey))
+            val page = parseModelPage(text)
+            models.addAll(page.ids)
+            after = page.nextCursor
+            check(after == null || cursors.add(after)) { "服务商返回了重复的分页游标，模型列表未完整拉取。" }
+        } while (after != null)
+        return models.sorted()
     }
 
     suspend fun chat(
@@ -66,35 +77,38 @@ class OpenAiClient {
         model: String,
         messages: JSONArray,
         tools: JSONArray? = null,
-        temperature: Double = 0.6,
-    ): ChatResult = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) return@withContext ChatResult("", emptyList(), "先填写 API Key")
-        if (model.isBlank()) return@withContext ChatResult("", emptyList(), "先填写或选择模型名")
+        temperature: Double? = 0.6,
+    ): ChatResult {
+        if (apiKey.isBlank()) return ChatResult("", emptyList(), "先填写 API Key")
+        if (model.isBlank()) return ChatResult("", emptyList(), "先填写或选择模型名")
         val url = chatCompletionsUrl(baseUrl)
         val payload = JSONObject()
             .put("model", model)
-            .put("temperature", temperature)
             .put("messages", messages)
             .put("stream", false)
+        if (temperature != null) payload.put("temperature", temperature)
         if (tools != null && tools.length() > 0) payload.put("tools", tools)
-        val (code, text) = try {
-            execute(
-                http,
-                Request.Builder()
-                    .url(url)
-                    .header("Authorization", bearer(apiKey))
-                    .post(payload.toString().toRequestBody(JSON))
-                    .build(),
-            )
+        suspend fun send(): Pair<Int, String> {
+            val request = Request.Builder().url(url)
+                .header("Authorization", bearer(apiKey))
+                .post(payload.toString().toRequestBody(JSON)).build()
+            return execute(http, request) { it.code to it.body?.string().orEmpty() }
+        }
+        try {
+            val first = send()
+            val (code, text) = if (temperature != null && first.first in setOf(400, 422) &&
+                first.second.contains("temperature", ignoreCase = true)
+            ) {
+                payload.remove("temperature")
+                send()
+            } else first
+            if (code !in 200..299) return ChatResult("", emptyList(), apiError(code, text, apiKey))
+            return parseChat(text, apiKey)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: Exception) {
-            return@withContext ChatResult("", emptyList(), describeTransportFailure(error))
+            return ChatResult("", emptyList(), describeTransportFailure(error).replace(apiKey, "••••"))
         }
-        if (code !in 200..299) return@withContext ChatResult("", emptyList(), readableApiError(code, text))
-        if (!text.contains("\"choices\"")) {
-            val message = extractApiMessage(text)
-            if (text.contains("\"error\"") && message.isNotBlank()) return@withContext ChatResult("", emptyList(), message)
-        }
-        parseChat(text)
     }
 
     suspend fun streamChat(
@@ -105,7 +119,6 @@ class OpenAiClient {
     ): StreamResult = suspendCancellableCoroutine { cont ->
         val payload = JSONObject()
             .put("model", model)
-            .put("temperature", 0.7)
             .put("messages", messages)
             .put("stream", true)
         val request = Request.Builder()
@@ -130,7 +143,9 @@ class OpenAiClient {
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: okhttp3.Response?) {
                 if (!cont.isActive) return
-                val err = "HTTP ${response?.code ?: ""} ${t?.message ?: "网络中断"}".trim()
+                val err = if (response != null) {
+                    apiError(response.code, runCatching { response.body?.string() }.getOrNull().orEmpty(), apiKey)
+                } else describeTransportFailure(t ?: IOException("网络中断")).replace(apiKey, "••••")
                 if (acc.isEmpty()) {
                     cont.resume(StreamResult("", err))
                 } else {
@@ -142,25 +157,31 @@ class OpenAiClient {
     }
 
     suspend fun transcribe(baseUrl: String, apiKey: String, path: String, model: String, file: File): String =
-        withContext(Dispatchers.IO) {
-            val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
-                .addFormDataPart("file", file.name, file.asRequestBody("audio/wav".toMediaType()))
-            if (!path.contains("tools/asr")) multipart.addFormDataPart("model", model)
-            val request = Request.Builder()
-                .url(endpointUrl(baseUrl, path.ifBlank { "/audio/transcriptions" }))
-                .header("Authorization", bearer(apiKey))
-                .post(multipart.build())
-                .build()
-            http.newCall(request).execute().use { response ->
-                val text = response.body?.string().orEmpty()
-                if (!response.isSuccessful) error(readableApiError(response.code, text))
-                val json = runCatching { JSONObject(text) }.getOrNull()
-                json?.optString("text").orEmpty().ifBlank { text }
+        transcribeAudio(baseUrl, apiKey, path, model, file.name, file.asRequestBody(WAV))
+
+    internal suspend fun transcribeAudio(
+        baseUrl: String, apiKey: String, path: String, model: String, filename: String, audio: okhttp3.RequestBody,
+    ): String {
+        val url = audioEndpoint(baseUrl, path.ifBlank { "/audio/transcriptions" })
+        val multipart = MultipartBody.Builder().setType(MultipartBody.FORM).addFormDataPart("file", filename, audio)
+        if (!url.toHttpUrl().encodedPath.endsWith("/tools/asr")) multipart.addFormDataPart("model", model)
+        val request = Request.Builder().url(url).header("Authorization", bearer(apiKey)).post(multipart.build()).build()
+        return execute(http, request) { response ->
+            val text = response.body?.string().orEmpty()
+            if (!response.isSuccessful) error(apiError(response.code, text, apiKey))
+            val json = runCatching { JSONObject(text) }.getOrNull()
+            when {
+                json?.has("error") == true -> error(extractApiMessage(text.replace(apiKey, "••••")))
+                json?.opt("text") is String -> json.getString("text")
+                json?.optJSONObject("data")?.opt("text") is String -> json.getJSONObject("data").getString("text")
+                response.body?.contentType()?.subtype == "plain" -> text
+                else -> error("语音接口没有返回可识别的转写结果。")
             }
         }
+    }
 
     suspend fun vision(baseUrl: String, apiKey: String, model: String, prompt: String, jpeg: ByteArray): String {
-        val data = android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP)
+        val data = Base64.getEncoder().encodeToString(jpeg)
         val content = JSONArray()
             .put(JSONObject().put("type", "text").put("text", prompt))
             .put(
@@ -175,25 +196,36 @@ class OpenAiClient {
         return result.content
     }
 
-    suspend fun tts(baseUrl: String, apiKey: String, path: String, model: String, text: String): ByteArray =
-        withContext(Dispatchers.IO) {
-            val payload = JSONObject().put("model", model.ifBlank { "tts-1" }).put("input", text).put("voice", "alloy")
-            val request = Request.Builder()
-                .url(endpointUrl(baseUrl, path.ifBlank { "/audio/speech" }))
-                .header("Authorization", bearer(apiKey))
-                .post(payload.toString().toRequestBody(JSON))
-                .build()
-            http.newCall(request).execute().use { response ->
-                val bytes = response.body?.bytes() ?: ByteArray(0)
-                if (!response.isSuccessful) error(readableApiError(response.code, String(bytes)))
-                bytes
-            }
+    suspend fun tts(baseUrl: String, apiKey: String, path: String, model: String, text: String): ByteArray {
+        val payload = JSONObject().put("model", model.ifBlank { "tts-1" }).put("input", text).put("voice", "alloy")
+        val request = Request.Builder()
+            .url(audioEndpoint(baseUrl, path.ifBlank { "/audio/speech" }))
+            .header("Authorization", bearer(apiKey))
+            .post(payload.toString().toRequestBody(JSON)).build()
+        return execute(http, request) { response ->
+            val body = response.body
+            val bytes = body?.bytes() ?: ByteArray(0)
+            if (!response.isSuccessful) error(apiError(response.code, String(bytes), apiKey))
+            val type = body?.contentType()
+            val validAudio = type?.type == "audio" ||
+                (type?.subtype == "octet-stream" && looksLikeAudio(bytes))
+            check(validAudio && bytes.size > 32) { "云端音色接口没有返回可播放的音频。" }
+            bytes
         }
+    }
 
-    private fun parseChat(text: String): ChatResult {
-        val root = runCatching { JSONObject(text) }.getOrElse { return ChatResult("", emptyList(), text) }
+    private fun looksLikeAudio(bytes: ByteArray): Boolean {
+        val start = bytes.take(4).toByteArray().toString(Charsets.US_ASCII)
+        return start.startsWith("ID3") || start == "RIFF" || start == "OggS" || start == "fLaC" ||
+            (bytes.size >= 2 && (bytes[0].toInt() and 0xff) == 0xff && (bytes[1].toInt() and 0xe0) == 0xe0)
+    }
+
+    private fun parseChat(text: String, key: String): ChatResult {
+        val invalid = ChatResult("", emptyList(), "模型接口没有返回有效的对话回复。")
+        val root = runCatching { JSONObject(text) }.getOrElse { return invalid }
+        if (root.has("error")) return ChatResult("", emptyList(), extractApiMessage(text.replace(key, "••••")))
         val message = root.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
-            ?: return ChatResult("", emptyList(), text)
+            ?: return invalid
         val tools = message.optJSONArray("tool_calls")
         val calls = buildList {
             if (tools != null) {
@@ -210,16 +242,31 @@ class OpenAiClient {
                 }
             }
         }
-        return ChatResult(message.optString("content"), calls)
+        val content = message.opt("content") as? String ?: ""
+        return if (content.isBlank() && calls.isEmpty()) invalid else ChatResult(content, calls)
     }
 
-    private fun execute(client: OkHttpClient, request: Request): Pair<Int, String> =
-        client.newCall(request).execute().use { response ->
-            response.code to response.body?.string().orEmpty()
+    private suspend fun <T> execute(client: OkHttpClient, request: Request, read: (Response) -> T): T =
+        suspendCancellableCoroutine { continuation ->
+            val call = client.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) continuation.resumeWithException(e)
+                }
+                override fun onResponse(call: Call, response: Response) {
+                    val result = runCatching { response.use(read) }
+                    if (continuation.isActive) continuation.resumeWith(result)
+                }
+            })
         }
+
+    private fun apiError(code: Int, text: String, key: String) =
+        readableApiError(code, if (key.isBlank()) text else text.replace(key, "••••"))
 
     companion object {
         private val JSON = "application/json; charset=utf-8".toMediaType()
+        internal val WAV = "audio/wav".toMediaType()
 
         fun bearer(key: String) = "Bearer $key"
 

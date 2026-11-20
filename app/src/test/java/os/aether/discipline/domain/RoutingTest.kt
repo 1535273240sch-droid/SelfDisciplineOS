@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RoutingTest {
@@ -77,12 +78,12 @@ class RoutingTest {
     }
 
     @Test
-    fun modelIdsAreDistinctAndSorted() {
+    fun modelPageChecksShapeAndPreservesCursorOrder() {
         val body = """
             {"data":[{"id":"deepseek-reasoner"},{"id":""},{"id":"deepseek-chat"},{"id":"deepseek-chat"}]}
         """.trimIndent()
-        assertEquals(listOf("deepseek-chat", "deepseek-reasoner"), parseModelIds(body))
-        assertTrue(parseModelIds("not-json").isEmpty())
+        assertEquals(listOf("deepseek-reasoner", "deepseek-chat", "deepseek-chat"), parseModelPage(body).ids)
+        assertThrows(IllegalStateException::class.java) { parseModelPage("not-json") }
     }
 
     @Test
@@ -152,38 +153,14 @@ class RoutingTest {
     }
 
     @Test
-    fun bindingChoosesManualModelAndSkipsOtherProviders() {
-        assertEquals("deepseek-chat", chooseModel(" deepseek-chat ", listOf("other")))
-        assertEquals("other", chooseModel("  ", listOf("other", "second")))
-        assertEquals("", chooseModel("", emptyList()))
-
-        val bound = mapOf("companion" to 7L, "vision" to 7L)
-        assertEquals(listOf("fast", "briefing"), scenesToAssign(bound, providerId = 3L))
-        assertEquals(listOf("companion", "fast", "briefing"), scenesToAssign(bound, providerId = 7L))
-        assertEquals(listOf("companion", "fast", "briefing"), scenesToAssign(emptyMap(), providerId = 1L))
-    }
-
-    @Test
-    fun testCopyExplainsSuccessFailureAndManualFallback() {
-        val ok = modelTestCopy(null, 8, "deepseek-chat", listOf("搭档对话", "快速记录", "早报总结"))
-        assertTrue(ok.connected)
-        assertTrue(ok.text.contains("共拉取 8 个模型"))
-        assertTrue(ok.text.contains("已绑定搭档对话、快速记录、早报总结"))
-
-        val manual = modelTestCopy("密钥无效或没有权限（HTTP 401）", 0, "deepseek-chat", listOf("搭档对话"))
-        assertFalse(manual.connected)
-        assertTrue(manual.text.contains("已保留手动模型"))
-        assertTrue(manual.text.contains("HTTP 401"))
-
-        val blocked = modelTestCopy("先填写 API Key", 0, "", emptyList())
-        assertEquals("先填写 API Key", blocked.text)
-    }
-
-    @Test
-    fun greetingDoesNotNeedAName() {
-        assertEquals("早上好", greetingForHour(7))
-        assertEquals("中午好", greetingForHour(12))
-        assertEquals("下午好", greetingForHour(15))
-        assertEquals("晚上好", greetingForHour(23))
+    fun baseValidationAndAbsoluteAudioRouteDoNotReuseKeysAcrossHosts() {
+        assertEquals("https://open.bigmodel.cn/api/paas/v4", requireProviderBase(" HTTPS://open.bigmodel.cn/api/paas/v4/models/ "))
+        assertEquals("https://example.com/v1/audio/speech", audioEndpoint("https://example.com/v1", "/audio/speech"))
+        assertEquals("https://example.com/tools/asr", audioEndpoint("https://example.com/v1", "https://example.com/tools/asr"))
+        assertThrows(IllegalArgumentException::class.java) { audioEndpoint("https://example.com/v1", "https://other.example/tools/asr") }
+        assertThrows(IllegalArgumentException::class.java) { requireProviderBase("http://example.com") }
+        assertThrows(IllegalArgumentException::class.java) { requireProviderBase("https://secret@example.com/v1") }
+        assertThrows(IllegalArgumentException::class.java) { requireProviderBase("https://example.com?v=1") }
+        assertThrows(IllegalArgumentException::class.java) { requireProviderBase("ftp://example.com") }
     }
 }

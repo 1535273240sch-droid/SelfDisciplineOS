@@ -6,7 +6,10 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * OpenAI-compatible URL joining.
@@ -19,7 +22,8 @@ import kotlinx.serialization.json.jsonObject
 fun normalizeApiBase(raw: String): String {
     var base = raw.trim().trim('"', '\'').trim()
     if (base.isEmpty()) return ""
-    if (!base.startsWith("http://") && !base.startsWith("https://")) base = "https://$base"
+    if (!base.startsWith("http://", true) && !base.startsWith("https://", true)) base = "https://$base"
+    base = base.replaceBefore("://", base.substringBefore("://").lowercase())
     base = base.trimEnd('/')
     val suffixes = listOf(
         "/chat/completions",
@@ -61,6 +65,31 @@ fun endpointUrl(base: String, path: String): String {
 fun modelsUrl(base: String): String = endpointUrl(base, "/models")
 
 fun chatCompletionsUrl(base: String): String = endpointUrl(base, "/chat/completions")
+
+fun requireProviderBase(raw: String): String {
+    val clean = raw.trim().trim('"', '\'').trim()
+    val url = normalizeApiBase(clean).toHttpUrlOrNull()
+    require(clean.isNotBlank() && (!clean.contains("://") || clean.startsWith("https://", true)) &&
+        clean.none { it.isWhitespace() || it == '\\' } && url != null && url.isHttps && url.hasNoCredentials() &&
+        url.query == null && url.fragment == null) { "请填写有效的 HTTPS Base URL，密钥填在 API Key 一栏。" }
+    return url.toString().trimEnd('/')
+}
+
+fun sameApiOrigin(first: String, second: String): Boolean {
+    val a = first.toHttpUrlOrNull() ?: return false
+    val b = second.toHttpUrlOrNull() ?: return false
+    return a.scheme == b.scheme && a.host == b.host && a.port == b.port
+}
+
+fun audioEndpoint(base: String, path: String): String {
+    val url = endpointUrl(base, path).toHttpUrlOrNull()
+    require(url != null && url.hasNoCredentials() && url.fragment == null && sameApiOrigin(base, url.toString())) {
+        "音频路径须与 Base URL 使用相同域名、端口和协议。"
+    }
+    return url.toString()
+}
+
+private fun HttpUrl.hasNoCredentials() = encodedUsername.isEmpty() && encodedPassword.isEmpty()
 
 fun extractApiMessage(body: String): String {
     val trimmed = body.trim()
@@ -109,13 +138,22 @@ fun describeTransportFailure(error: Throwable): String {
 
 private val jsonParser = Json { ignoreUnknownKeys = true; isLenient = true }
 
-fun parseModelIds(body: String): List<String> {
-    val root = runCatching { jsonParser.parseToJsonElement(body) }.getOrNull() as? JsonObject ?: return emptyList()
-    val data = root["data"] as? JsonArray ?: return emptyList()
-    return data.mapNotNull { element ->
+internal data class ModelPage(val ids: List<String>, val nextCursor: String?)
+
+internal fun parseModelPage(body: String): ModelPage {
+    val root = runCatching { jsonParser.parseToJsonElement(body) }.getOrNull() as? JsonObject
+    val data = root?.get("data") as? JsonArray
+        ?: error("模型列表接口未返回有效的 data 数组，可改用手填模型后测试。")
+    val ids = data.mapNotNull { element ->
         val id = (element as? JsonObject)?.get("id") as? JsonPrimitive
-        id?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
-    }.distinct().sorted()
+        id?.takeIf { it.isString }?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+    }
+    require(data.isEmpty() || ids.isNotEmpty()) { "模型列表里没有有效的模型 ID。" }
+    val next = if ((root?.get("has_more") as? JsonPrimitive)?.booleanOrNull == true) {
+        (root["last_id"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotBlank)
+            ?: ids.lastOrNull() ?: error("模型列表标记还有下一页，但缺少分页游标。")
+    } else null
+    return ModelPage(ids, next)
 }
 
 @Serializable
@@ -254,19 +292,7 @@ fun greetingForHour(hour: Int): String = when (hour) {
     else -> "晚上好"
 }
 
-fun chooseModel(manual: String, fetched: List<String>): String {
-    val typed = manual.trim()
-    if (typed.isNotBlank()) return typed
-    return fetched.firstOrNull().orEmpty()
-}
-
-val CHAT_SCENES = listOf("companion", "fast", "briefing")
-
-fun scenesToAssign(boundProviderByScene: Map<String, Long>, providerId: Long): List<String> =
-    CHAT_SCENES.filter { scene ->
-        val owner = boundProviderByScene[scene]
-        owner == null || owner == providerId
-    }
+val MODEL_SCENES = listOf("companion", "fast", "transcribe", "vision", "briefing", "tts")
 
 fun sceneLabel(scene: String): String = when (scene) {
     "companion" -> "搭档对话"
@@ -276,24 +302,4 @@ fun sceneLabel(scene: String): String = when (scene) {
     "briefing" -> "早报总结"
     "tts" -> "云端音色"
     else -> scene
-}
-
-data class ModelTestCopy(val connected: Boolean, val text: String)
-
-fun modelTestCopy(
-    fetchError: String?,
-    modelCount: Int,
-    chosenModel: String,
-    assignedLabels: List<String>,
-): ModelTestCopy {
-    val assigned = if (assignedLabels.isEmpty()) "" else "已绑定${assignedLabels.joinToString("、")}。"
-    if (fetchError == null) {
-        val head = if (modelCount == 0) "已连通，但服务商没有返回模型列表。" else "已连通，共拉取 $modelCount 个模型。"
-        val manual = if (modelCount == 0 && chosenModel.isNotBlank()) "已使用手动模型「$chosenModel」。" else ""
-        return ModelTestCopy(true, (head + manual + assigned).trim())
-    }
-    if (chosenModel.isNotBlank()) {
-        return ModelTestCopy(false, "列表拉取失败，已保留手动模型「$chosenModel」。$assigned\n$fetchError".trim())
-    }
-    return ModelTestCopy(false, fetchError)
 }

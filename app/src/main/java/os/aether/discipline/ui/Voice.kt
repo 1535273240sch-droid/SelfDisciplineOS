@@ -430,7 +430,7 @@ private suspend fun submit(
     }
     repo.saveMessage("USER", heard)
     val local = parseUtterance(heard, LocalTime.now().hour)
-    val fast = repo.bound("fast") ?: repo.bound("companion")
+    val fast = repo.bound("fast")
     val toolNames = mutableSetOf<String>()
     val toolNotes = mutableListOf<String>()
     val failures = mutableListOf<String>()
@@ -561,20 +561,14 @@ private suspend fun submit(
                 reply = "API Key 无效或已过期（" + err.take(40) + "）。设置 → AI 路由中心重新保存 Key。"
             } else if (err.contains("429")) {
                 reply = "请求太频繁或额度不足（429）。过一会儿再试，或换一个渠道。"
-            } else if (err.contains("tool", true) || err.contains("function", true)) {
+            } else if (err.contains("tool", true) || err.contains("function", true) ||
+                err.contains("HTTP 400") || err.contains("HTTP 422")
+            ) {
                 val plain = JSONArray()
                     .put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT + "\n\n" + repo.snapshot()))
                     .put(JSONObject().put("role", "user").put("content", heard))
-                val streamed = runCatching {
-                    repo.ai.streamChat(companion.provider.baseUrl, companion.key, companion.model, plain)
-                }.getOrNull()
-                val streamedText = streamed?.text.orEmpty()
-                val streamedError = streamed?.error
-                reply = when {
-                    streamedText.isNotBlank() -> streamedText.trim()
-                    streamedError != null -> "这个模型不支持工具调用，普通对话也失败了：" + streamedError.take(120)
-                    else -> "这个模型不支持工具调用，已按普通对话重试但没有结果。"
-                }
+                val retry = repo.ai.chat(companion.provider.baseUrl, companion.key, companion.model, plain, temperature = null)
+                reply = retry.content.trim().ifBlank { "普通对话请求失败：" + retry.error.orEmpty().ifBlank { err }.take(120) }
             } else {
                 reply = "模型调用失败：" + err.take(160)
             }

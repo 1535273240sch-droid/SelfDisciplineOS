@@ -5,6 +5,7 @@ import android.os.SystemClock
 import androidx.room.withTransaction
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.flow
@@ -17,6 +18,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import os.aether.discipline.ai.KeystoreCrypto
 import os.aether.discipline.ai.OpenAiClient
+import os.aether.discipline.ai.verifyModel
 import os.aether.discipline.content.Phrase
 import os.aether.discipline.content.categoryLabel
 import os.aether.discipline.content.convictCatalog
@@ -55,15 +57,14 @@ import os.aether.discipline.domain.PlanContext
 import os.aether.discipline.domain.QuestionRef
 import os.aether.discipline.domain.SYSTEM_PROMPT
 import os.aether.discipline.domain.Thresholds
-import os.aether.discipline.domain.chooseModel
+import os.aether.discipline.domain.MODEL_SCENES
+import os.aether.discipline.domain.audioEndpoint
 import os.aether.discipline.domain.localFallbackPlan
-import os.aether.discipline.domain.modelTestCopy
-import os.aether.discipline.domain.normalizeApiBase
+import os.aether.discipline.domain.requireProviderBase
+import os.aether.discipline.domain.sameApiOrigin
 import os.aether.discipline.domain.parseDailyPlan
 import os.aether.discipline.domain.planFromJson
 import os.aether.discipline.domain.planToJson
-import os.aether.discipline.domain.sceneLabel
-import os.aether.discipline.domain.scenesToAssign
 import os.aether.discipline.domain.answersMatch
 import os.aether.discipline.domain.buildDailyPaper
 import os.aether.discipline.domain.carriedStreak
@@ -146,14 +147,17 @@ data class TodayUi(
     val aiReady: Boolean = false,
 )
 
-data class ModelTestResult(
-    val ok: Boolean,
-    val providerId: Long,
-    val models: List<String>,
-    val chosenModel: String,
-    val message: String,
-    val normalizedBase: String,
+internal class ProviderDraft(
+    val id: Long?,
+    val name: String,
+    val baseUrl: String,
+    val apiKey: String,
+    val transcriptionPath: String,
 )
+
+internal data class ProviderCatalog(val models: List<String>, val baseUrl: String)
+
+private class ProviderConnection(val previous: AiProviderConfig?, val name: String, val base: String, val key: String, val path: String)
 
 data class Bound(val provider: AiProviderConfig, val model: String, val key: String, val path: String)
 
@@ -765,88 +769,93 @@ class AetherRepository(context: Context) {
         JSONObject().put("rows", rows).put("note", "折线为体重，柱形为热量，红点标记作息越线。").toString()
     }
 
-    suspend fun addProvider(name: String, baseUrl: String, apiKey: String, path: String): Long =
-        upsertProvider(null, name, baseUrl, apiKey, path)
-
-    suspend fun upsertProvider(id: Long?, name: String, baseUrl: String, apiKey: String, path: String): Long {
-        val normalized = normalizeApiBase(baseUrl)
-        val transcript = path.ifBlank { "/audio/transcriptions" }
-        val existing = id?.let { db.ai().provider(it) }
-        if (existing == null) {
-            if (apiKey.isBlank()) error("先填写 API Key")
-            return db.ai().insertProvider(
-                AiProviderConfig(
-                    providerName = name.trim(),
-                    baseUrl = normalized,
-                    apiKeyEncrypted = KeystoreCrypto.encrypt(apiKey.trim()),
-                    transcriptionPath = transcript,
-                ),
-            )
-        }
-        val encrypted = if (apiKey.isBlank()) existing.apiKeyEncrypted else KeystoreCrypto.encrypt(apiKey.trim())
-        db.ai().updateProvider(
-            existing.copy(
-                providerName = name.trim(),
-                baseUrl = normalized,
-                apiKeyEncrypted = encrypted,
-                transcriptionPath = transcript,
-            ),
-        )
-        return existing.id
+    internal suspend fun discoverModels(draft: ProviderDraft): ProviderCatalog = withContext(Dispatchers.IO) {
+        val connection = prepareProvider(draft)
+        ProviderCatalog(ai.listModels(connection.base, connection.key), connection.base)
     }
 
-    suspend fun testProvider(
-        id: Long?,
-        name: String,
-        baseUrl: String,
-        apiKey: String,
-        path: String,
-        manualModel: String,
-    ): ModelTestResult = withContext(Dispatchers.IO) {
-        val normalized = normalizeApiBase(baseUrl)
-        fun fail(message: String, providerId: Long = id ?: 0, models: List<String> = emptyList()) = ModelTestResult(
-            ok = false,
-            providerId = providerId,
-            models = models,
-            chosenModel = "",
-            message = message,
-            normalizedBase = normalized,
-        )
-        if (name.isBlank()) return@withContext fail("先填写渠道名称")
-        if (normalized.isBlank()) return@withContext fail("先填写 Base URL")
-        val existing = id?.let { db.ai().provider(it) }
-        val typedKey = apiKey.trim()
-        val secret = if (typedKey.isNotBlank()) {
-            typedKey
-        } else if (existing == null) {
-            return@withContext fail("先填写 API Key")
-        } else {
-            when (val plain = KeystoreCrypto.decryptOrNull(existing.apiKeyEncrypted)) {
-                null -> return@withContext fail("密钥无法解密，请重新填写 API Key")
-                "" -> return@withContext fail("先填写 API Key")
-                else -> plain
+    internal suspend fun activateModel(
+        draft: ProviderDraft, scene: String, selection: String, catalog: List<String>?,
+    ): Long = withContext(Dispatchers.IO) {
+        require(scene in MODEL_SCENES) { "未知模型场景" }
+        val model = selection.trim()
+        require(model.isNotEmpty()) { "请先选择或填写模型名。" }
+        val connection = prepareProvider(draft)
+        val previous = connection.previous
+        val changedKey = draft.apiKey.isNotBlank() && previous != null &&
+            KeystoreCrypto.decryptOrNull(previous.apiKeyEncrypted) != connection.key
+        fun affected(binding: SceneBinding): Boolean = previous != null &&
+            binding.providerId == previous.id && binding.scene != scene &&
+            (changedKey || connection.base != previous.baseUrl ||
+                (binding.scene == "transcribe" && connection.path != previous.transcriptionPath))
+        val affectedRoutes = sceneBindings().filter(::affected)
+        val speechPath = raw("scene_tts_path").ifBlank { "/audio/speech" }
+        fun pathFor(target: String) = if (target == "tts") speechPath else connection.path
+        ai.verifyModel(scene, connection.base, connection.key, model, pathFor(scene))
+        for (route in affectedRoutes) {
+            try {
+                ai.verifyModel(route.scene, connection.base, connection.key, route.model, pathFor(route.scene))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                val detail = failure.message.orEmpty().replace(connection.key, "••••")
+                error("该渠道已绑定${os.aether.discipline.domain.sceneLabel(route.scene)}，新配置的复测失败：$detail")
             }
         }
-        val savedId = try {
-            upsertProvider(existing?.id, name, normalized, if (typedKey.isNotBlank()) secret else "", path)
-        } catch (error: Exception) {
-            return@withContext fail(error.message ?: "无法保存密钥")
+
+        db.withTransaction {
+            if (previous != null) {
+                check(db.ai().provider(previous.id) == previous) { "渠道已在其他页面更新，请重新选择后测试。" }
+                check(sceneBindings().filter(::affected) == affectedRoutes) { "该渠道的绑定已更新，请重新测试。" }
+            }
+            if (scene == "tts" || affectedRoutes.any { it.scene == "tts" }) {
+                check(raw("scene_tts_path").ifBlank { "/audio/speech" } == speechPath) { "音色路径已更新，请重新测试。" }
+            }
+            val suppliedKey = draft.apiKey.isNotBlank()
+            val encrypted = if (suppliedKey || previous == null) KeystoreCrypto.encrypt(connection.key) else previous.apiKeyEncrypted
+            val oldCache = previous?.cachedModelsJson.orEmpty().ifBlank { "[]" }
+            val cache = when {
+                catalog != null -> JSONArray(catalog).toString()
+                connection.base == previous?.baseUrl && !suppliedKey -> oldCache
+                else -> "[]"
+            }
+            val provider = AiProviderConfig(
+                id = previous?.id ?: 0L,
+                providerName = connection.name,
+                baseUrl = connection.base,
+                apiKeyEncrypted = encrypted,
+                transcriptionPath = connection.path,
+                cachedModelsJson = cache,
+            )
+            val id = if (previous == null) db.ai().insertProvider(provider) else {
+                db.ai().updateProvider(provider)
+                previous.id
+            }
+            putRaw("scene_${scene}_provider", id.toString())
+            putRaw("scene_${scene}_model", model)
+            id
         }
-        val fetched = runCatching { ai.listModels(normalized, secret) }
-        val fetchError = fetched.exceptionOrNull()?.message?.trim()?.ifBlank { "拉取模型失败" }
-        val models = fetched.getOrDefault(emptyList())
-        if (fetched.isSuccess) cacheModels(savedId, models)
-        val displayModels = if (fetched.isSuccess) models else cachedModels(savedId)
-        val chosen = chooseModel(manualModel, if (fetched.isSuccess) models else emptyList())
-        val assigned = if (chosen.isBlank()) {
-            emptyList()
-        } else {
-            val owners = sceneBindings().associate { it.scene to it.providerId }
-            scenesToAssign(owners, savedId).onEach { scene -> bind(scene, savedId, chosen) }
-        }
-        val copy = modelTestCopy(fetchError, if (fetched.isSuccess) models.size else 0, chosen, assigned.map { sceneLabel(it) })
-        ModelTestResult(copy.connected, savedId, displayModels, chosen, copy.text, normalized)
     }
+
+    private suspend fun prepareProvider(draft: ProviderDraft): ProviderConnection {
+        val name = draft.name.trim()
+        require(name.isNotEmpty()) { "请填写渠道名称。" }
+        val base = requireProviderBase(draft.baseUrl)
+        val path = draft.transcriptionPath.trim().ifBlank { "/audio/transcriptions" }
+        audioEndpoint(base, path)
+        val previous = draft.id?.let { db.ai().provider(it) ?: error("渠道已删除，请新建渠道。") }
+        val key = draft.apiKey.trim().ifBlank {
+            require(previous != null) { "请填写 API Key。" }
+            require(sameApiOrigin(requireProviderBase(previous.baseUrl), base)) {
+                "渠道地址已变更，请重新填写该地址的 API Key。"
+            }
+            KeystoreCrypto.decryptOrNull(previous.apiKeyEncrypted)
+                ?.takeIf(String::isNotBlank) ?: error("本机无法解密已保存的密钥，请重新填写 API Key。")
+        }
+        require(key.all { it in '!'..'~' }) { "API Key 应为单行，不能含空格或换行。" }
+        return ProviderConnection(previous, name, base, key, path)
+    }
+
 
     suspend fun fallbackPlan(): DailyPlan = withContext(Dispatchers.IO) { localFallbackPlan(currentPlanContext()) }
 
@@ -914,17 +923,6 @@ class AetherRepository(context: Context) {
         )
     }
 
-    suspend fun replaceKey(id: Long, apiKey: String) {
-        val row = db.ai().provider(id) ?: return
-        if (apiKey.isBlank()) return
-        db.ai().updateProvider(row.copy(apiKeyEncrypted = KeystoreCrypto.encrypt(apiKey.trim())))
-    }
-
-    suspend fun cacheModels(id: Long, models: List<String>) {
-        val row = db.ai().provider(id) ?: return
-        db.ai().updateProvider(row.copy(cachedModelsJson = JSONArray(models).toString()))
-    }
-
     suspend fun cachedModels(providerId: Long): List<String> {
         val raw = db.ai().provider(providerId)?.cachedModelsJson ?: return emptyList()
         return runCatching {
@@ -938,7 +936,7 @@ class AetherRepository(context: Context) {
         }.getOrDefault(emptyList())
     }
 
-    suspend fun deleteProvider(id: Long) {
+    suspend fun deleteProvider(id: Long) = db.withTransaction {
         val target = id.toString()
         db.thresholds().all()
             .filter { it.key.startsWith("scene_") && it.key.endsWith("_provider") && it.value.trim() == target }
@@ -950,41 +948,33 @@ class AetherRepository(context: Context) {
         db.ai().deleteProvider(id)
     }
 
-    suspend fun bound(scene: String): Bound? {
-        val id = raw("scene_${scene}_provider").toLongOrNull() ?: return null
-        val model = raw("scene_${scene}_model")
-        val provider = db.ai().provider(id) ?: return null
+    suspend fun bound(scene: String): Bound? = db.withTransaction {
+        val id = raw("scene_${scene}_provider").trim().toLongOrNull() ?: return@withTransaction null
+        val model = raw("scene_${scene}_model").trim()
+        val provider = db.ai().provider(id) ?: return@withTransaction null
         val key = KeystoreCrypto.decrypt(provider.apiKeyEncrypted)
-        if (key.isBlank() || model.isBlank()) return null
+        if (key.isBlank() || model.isBlank()) return@withTransaction null
         val path = if (scene == "tts") raw("scene_tts_path").ifBlank { "/audio/speech" } else provider.transcriptionPath
-        return Bound(provider, model, key, path)
+        Bound(provider, model, key, path)
     }
 
-    suspend fun bind(scene: String, providerId: Long, model: String) {
-        putRaw("scene_${scene}_provider", providerId.toString())
-        putRaw("scene_${scene}_model", model)
+    suspend fun unbind(scene: String) = db.withTransaction {
+        require(scene in MODEL_SCENES) { "未知模型场景" }
+        putRaw("scene_${scene}_provider", "")
+        putRaw("scene_${scene}_model", "")
     }
 
-    suspend fun unbind(scene: String) {
-        val key = scene.trim()
-        if (key.isBlank()) return
-        putRaw("scene_${key}_provider", "")
-        putRaw("scene_${key}_model", "")
-    }
-
-    suspend fun sceneBindings(): List<SceneBinding> {
+    suspend fun sceneBindings(): List<SceneBinding> = db.withTransaction {
         val rows = db.thresholds().all()
         val values = rows.associate { it.key to it.value }
-        return rows.mapNotNull { row ->
-            if (!row.key.startsWith("scene_") || !row.key.endsWith("_provider")) return@mapNotNull null
-            val scene = row.key.removePrefix("scene_").removeSuffix("_provider")
-            if (scene.isBlank()) return@mapNotNull null
-            val providerId = row.value.trim().toLongOrNull() ?: return@mapNotNull null
+        val providersById = db.ai().providers().associateBy { it.id }
+        MODEL_SCENES.mapNotNull { scene ->
+            val providerId = values["scene_${scene}_provider"]?.trim()?.toLongOrNull() ?: return@mapNotNull null
             val model = values["scene_${scene}_model"]?.trim().orEmpty()
             if (model.isBlank()) return@mapNotNull null
-            val provider = db.ai().provider(providerId) ?: return@mapNotNull null
+            val provider = providersById[providerId] ?: return@mapNotNull null
             SceneBinding(scene, providerId, provider.providerName, model)
-        }.sortedBy { it.scene }
+        }
     }
 
     suspend fun importQuestions(json: String): Int {

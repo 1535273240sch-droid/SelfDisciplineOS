@@ -49,6 +49,7 @@ object KeystoreCrypto {
         }
     }
 
+    @Synchronized
     private fun key(): SecretKey {
         val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         (store.getKey(ALIAS, null) as? SecretKey)?.let { return it }
