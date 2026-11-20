@@ -14,6 +14,8 @@ interface WeightDao {
     suspend fun latest(): WeightRecord?
     @Query("SELECT * FROM weight_records WHERE date = :date ORDER BY timestamp DESC")
     suspend fun forDate(date: String): List<WeightRecord>
+    @Query("SELECT * FROM weight_records WHERE date < :date ORDER BY date DESC, timestamp DESC LIMIT 1")
+    suspend fun previous(date: String): WeightRecord?
     @Query("SELECT * FROM weight_records ORDER BY timestamp DESC LIMIT :limit")
     suspend fun recent(limit: Int): List<WeightRecord>
     @Query("SELECT COUNT(*) FROM weight_records WHERE date = :date AND isBackfill = 0")

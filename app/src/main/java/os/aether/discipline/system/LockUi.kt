@@ -40,6 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import os.aether.discipline.ui.aetherSpring
@@ -51,7 +52,10 @@ import os.aether.discipline.ui.AetherPureBlack
 import os.aether.discipline.ui.AetherTheme
 import os.aether.discipline.ui.Body
 import os.aether.discipline.ui.GlassCard
+import os.aether.discipline.ui.PageTitle
 import os.aether.discipline.ui.Quiet
+import os.aether.discipline.ui.ScreenColumn
+import os.aether.discipline.ui.observeAetherTheme
 import java.time.LocalDate
 import java.time.LocalTime
 
@@ -210,9 +214,11 @@ class BriefingActivity : ComponentActivity() {
         enableEdgeToEdge()
         setShowWhenLocked(true)
         setTurnScreenOn(true)
+        val themes = observeAetherTheme()
         setContent {
             val app = application as AetherApp
             val scope = rememberCoroutineScope()
+            val theme by themes.collectAsStateWithLifecycle(initialValue = "frost")
             var lines by remember { mutableStateOf("正在整理今早的简报。") }
             var news by remember { mutableStateOf("") }
             LaunchedEffect(Unit) {
@@ -224,12 +230,9 @@ class BriefingActivity : ComponentActivity() {
                 lines = app.repo.morningLines()
                 news = app.repo.today().briefing
             }
-            AetherTheme("frost") {
-                Column(
-                    Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(22.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    Quiet("早晨")
+            AetherTheme(theme) {
+                ScreenColumn(modifier = Modifier.windowInsetsPadding(WindowInsets.safeDrawing)) {
+                    PageTitle("早晨简报")
                     GlassCard { Body(lines) }
                     GlassCard { Quiet(news.take(700)) }
                     AccentButton("开始今天", {

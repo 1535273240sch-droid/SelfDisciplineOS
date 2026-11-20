@@ -29,8 +29,8 @@ android {
         applicationId = "os.aether.discipline"
         minSdk = 30
         targetSdk = 36
-        versionCode = 7
-        versionName = "2.1.4"
+        versionCode = 8
+        versionName = "2.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }

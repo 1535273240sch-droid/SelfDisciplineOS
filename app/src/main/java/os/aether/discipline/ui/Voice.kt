@@ -11,14 +11,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -30,11 +28,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -49,10 +51,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -60,9 +63,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.chrisbanes.haze.HazeStyle
-import dev.chrisbanes.haze.HazeTint
-import dev.chrisbanes.haze.hazeEffect
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -73,6 +74,7 @@ import os.aether.discipline.ai.ChatResult
 import os.aether.discipline.ai.toolSchema
 import os.aether.discipline.data.AetherRepository
 import os.aether.discipline.data.TodayUi
+import os.aether.discipline.data.ToolOutcome
 import os.aether.discipline.domain.SYSTEM_PROMPT
 import os.aether.discipline.domain.parseDailyPlan
 import os.aether.discipline.domain.parseUtterance
@@ -99,6 +101,8 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
     var modelName by remember { mutableStateOf<String?>(null) }
     var today by remember { mutableStateOf(TodayUi()) }
     var adopted by remember { mutableStateOf("") }
+    var sending by remember { mutableStateOf(false) }
+    val chatScroll = rememberLazyListState()
     val submitted = remember { AtomicBoolean(false) }
     val scale by animateFloatAsState(if (holding) 1.08f else 1f, aetherSpring(), label = "mic")
     val recorder = remember {
@@ -109,6 +113,35 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
     val tts = remember { TextToSpeech(context, null) }
     DisposableEffect(Unit) { onDispose { tts.shutdown(); recorder.stop() } }
     val micPermit = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    fun send(audio: File? = null, text: String? = null) {
+        if (sending) return
+        sending = true
+        scope.launch {
+            try {
+                adopted = ""
+                submit(repo, tts, audio, text) { typing = it }
+                today = repo.today()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                typing = "暂时处理不了这条消息，请稍后重试。"
+            } finally {
+                sending = false
+            }
+        }
+    }
+    fun sendDraft() {
+        if (sending || holding) return
+        val text = draft.trim()
+        if (text.isNotEmpty()) {
+            draft = ""
+            send(text = text)
+        }
+    }
+    LaunchedEffect(messages.lastOrNull()?.id, typing) {
+        val count = messages.size.coerceIn(1, 40) + if (typing.isNotBlank()) 1 else 0
+        if (count > 0) chatScroll.scrollToItem(count - 1)
+    }
     LaunchedEffect(Unit) {
         modelName = repo.bound("companion")?.model?.ifBlank { null }
         today = runCatching { repo.today() }.getOrDefault(today)
@@ -126,8 +159,7 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
         if (holding) {
             holding = false
             if (submitted.compareAndSet(false, true)) {
-                val file = recorder.stop()
-                scope.launch { submit(repo, tts, file, null) { typing = it } }
+                send(audio = recorder.stop())
             }
         }
     }
@@ -139,7 +171,6 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
     Column(
         Modifier
             .fillMaxSize()
-            .background(colors.background)
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
     ) {
@@ -202,13 +233,21 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
         LazyColumn(
             Modifier.weight(1f).fillMaxWidth().padding(top = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
+            state = chatScroll,
         ) {
+            if (messages.isEmpty()) item {
+                GlassCard {
+                    SectionTitle("今天聊什么？")
+                    Body("我可以帮你记体重、饮食和作息，也可以一起调整今天的安排。")
+                    Quiet("试试「今早空腹 72.4 公斤」")
+                }
+            }
             items(messages.takeLast(40)) { message ->
                 if (message.role == "USER") {
                     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
                         Text(
                             message.textContent,
-                            color = Color.White,
+                            color = colors.onAccent,
                             fontSize = 15.sp,
                             lineHeight = 22.sp,
                             modifier = Modifier
@@ -258,10 +297,8 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
                                     "再调一下",
                                     color = colors.accent,
                                     fontSize = 14.sp,
-                                    modifier = Modifier.clickable {
-                                        scope.launch {
-                                            submit(repo, tts, null, "再调一下今天的安排，按我的状态改轻一点，并调用 propose_daily_plan。") { typing = it }
-                                        }
+                                    modifier = Modifier.clickable(enabled = !sending && !holding) {
+                                        send(text = "再调一下今天的安排，按我的状态改轻一点，并调用 propose_daily_plan。")
                                     },
                                 )
                             }
@@ -279,8 +316,7 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
             Modifier
                 .fillMaxWidth()
                 .padding(top = 8.dp)
-                .clip(RoundedCornerShape(24.dp))
-                .background(colors.surface)
+                .glassSurface(RoundedCornerShape(24.dp), floating = true)
                 .padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -291,13 +327,7 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
                 textStyle = TextStyle(color = colors.textPrimary, fontSize = 15.sp),
                 cursorBrush = SolidColor(colors.accent),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = {
-                    val text = draft.trim()
-                    if (text.isNotEmpty()) {
-                        draft = ""
-                        scope.launch { submit(repo, tts, null, text) { typing = it } }
-                    }
-                }),
+                keyboardActions = KeyboardActions(onSend = { sendDraft() }),
                 decorationBox = { inner ->
                     Box {
                         if (draft.isEmpty()) Quiet("按住说话，或输入一句话")
@@ -311,11 +341,8 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
                     color = colors.accent,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.clickable {
-                        val text = draft.trim()
-                        draft = ""
-                        scope.launch { submit(repo, tts, null, text) { typing = it } }
-                    }.padding(horizontal = 8.dp, vertical = 8.dp),
+                    modifier = Modifier.clickable(enabled = !sending && !holding, onClick = ::sendDraft)
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
                 )
             }
             Box(
@@ -325,8 +352,10 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
                     .scale(scale)
                     .clip(CircleShape)
                     .background(colors.accent.copy(alpha = 0.85f + level.coerceIn(0f, 1f) * 0.15f))
+                    .semantics { contentDescription = "按住说话" }
                     .pointerInput(Unit) {
                         detectTapGestures(onPress = {
+                            if (sending) return@detectTapGestures
                             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                                 micPermit.launch(Manifest.permission.RECORD_AUDIO)
                             } else {
@@ -334,16 +363,19 @@ fun VoiceLayer(repo: AetherRepository, onClose: () -> Unit, onOpenRouting: () ->
                                 warn = false
                                 submitted.set(false)
                                 recorder.start()
-                                tryAwaitRelease()
+                                val released = tryAwaitRelease()
                                 holding = false
                                 if (submitted.compareAndSet(false, true)) {
                                     val file = recorder.stop()
-                                    submit(repo, tts, file, null) { typing = it }
+                                    if (released) send(audio = file)
                                 }
                             }
                         })
                     },
-            )
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Filled.Mic, null, tint = colors.onAccent, modifier = Modifier.size(20.dp))
+            }
         }
     }
 }
@@ -401,6 +433,7 @@ private suspend fun submit(
     val fast = repo.bound("fast") ?: repo.bound("companion")
     val toolNames = mutableSetOf<String>()
     val toolNotes = mutableListOf<String>()
+    val failures = mutableListOf<String>()
     var widget: String? = null
     var planPayload: String? = null
     var fastError: String? = null
@@ -421,14 +454,32 @@ private suspend fun submit(
                 toolNotes += out.message
                 if (call.name == "render_analytics_widget") widget = out.payload
             } else {
-                toolNotes += out.message
+                failures += out.message
             }
         }
     }
-    if ("record_weight" !in toolNames) local.weight?.let { repo.recordWeight(it.kg, it.fasting, if (fast == null) "VOICE_LOCAL_FALLBACK" else "VOICE") }
-    if ("record_sleep" !in toolNames) local.sleep?.let { repo.recordSleep(it.sleepHHmm, it.wakeHHmm) }
-    if ("record_diet" !in toolNames) local.diet?.let { repo.recordDiet(it.mealType, it.description, 0, 0f, 0f, 0f, needsBackfill = true) }
-    if ("record_calisthenics" !in toolNames) local.calisthenics?.let { repo.recordCalisthenics(it.category, it.step, it.sets, it.reps) }
+    if ("record_weight" !in toolNames) local.weight?.let {
+        repo.recordWeight(it.kg, it.fasting, "VOICE_LOCAL_FALLBACK")
+        toolNames += "record_weight"
+        toolNotes += "体重 ${it.kg} kg"
+    }
+    if ("record_sleep" !in toolNames) local.sleep?.let {
+        repo.recordSleep(it.sleepHHmm, it.wakeHHmm)
+        toolNames += "record_sleep"
+        toolNotes += "入睡 ${it.sleepHHmm}"
+    }
+    if ("record_diet" !in toolNames) local.diet?.let {
+        repo.recordDiet(it.mealType, it.description, 0, 0f, 0f, 0f, needsBackfill = true)
+        toolNames += "record_diet"
+        toolNotes += "饮食已记，热量待补"
+    }
+    if ("record_calisthenics" !in toolNames) local.calisthenics?.let {
+        val message = repo.recordCalisthenics(it.category, it.step, it.sets, it.reps)
+        if (!message.startsWith("动作分类不认识")) {
+            toolNames += "record_calisthenics"
+            toolNotes += message
+        }
+    }
 
     val companion = repo.bound("companion")
     var reply = ""
@@ -447,6 +498,8 @@ private suspend fun submit(
         }
     } else {
         onStatus("在想")
+        val writesAlreadyHandled = toolNames.toSet()
+        val processedWrites = mutableMapOf<Pair<String, String>, ToolOutcome>()
         val messages = JSONArray()
             .put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT + "\n\n" + BRAIN_RULES + "\n\n" + repo.snapshot()))
             .put(JSONObject().put("role", "user").put("content", heard))
@@ -480,10 +533,15 @@ private suspend fun submit(
             assistant.put("tool_calls", calls)
             messages.put(assistant)
             res.tools.forEach { call ->
-                val out = repo.executeTool(call.name, call.arguments)
+                val writeKey = call.name to call.arguments
+                val outcome = if (call.name in writesAlreadyHandled && call.name in WRITE_TOOLS) {
+                    ToolOutcome(true, "这条消息已完成该类写入。")
+                } else processedWrites[writeKey]
+                val out = outcome ?: repo.executeTool(call.name, call.arguments)
                 if (call.name == "propose_daily_plan" && out.payload != null) {
                     planPayload = out.payload
-                } else if (out.ok) {
+                } else if (out.ok && outcome == null) {
+                    if (call.name in WRITE_TOOLS) processedWrites[writeKey] = out
                     toolNames += call.name
                     toolNotes += out.message
                     if (call.name == "render_analytics_widget") widget = out.payload
@@ -522,6 +580,9 @@ private suspend fun submit(
             }
         }
     }
+    if (failures.isNotEmpty() && toolNotes.isEmpty() && companion == null) {
+        reply = failures.take(2).joinToString("；")
+    }
     if (toolNotes.isNotEmpty() && !reply.contains("已写入") && !reply.contains("已记录")) {
         reply = reply.trimEnd() + "\n\n已写入：" + toolNotes.take(3).joinToString("；")
     }
@@ -541,11 +602,23 @@ private suspend fun submit(
         if (mouth != null) {
             val bytes = runCatching { repo.ai.tts(mouth.provider.baseUrl, mouth.key, mouth.path, mouth.model, reply) }.getOrNull()
             if (bytes != null && bytes.size > 32) {
-                val dbPath = repo.db.openHelper.writableDatabase.path ?: return
-                val file = File(dbPath).parentFile?.let { File(it, "reply.mp3") } ?: return
-                file.writeBytes(bytes)
-                MediaPlayer().apply { setDataSource(file.absolutePath); prepare(); start() }
-                return
+                val file = withContext(Dispatchers.IO) {
+                    val dbPath = repo.db.openHelper.writableDatabase.path ?: return@withContext null
+                    File.createTempFile("tts-", ".mp3", File(dbPath).parentFile).apply { writeBytes(bytes) }
+                }
+                if (file != null) {
+                    val player = MediaPlayer()
+                    val started = runCatching {
+                        player.setDataSource(file.absolutePath)
+                        player.setOnCompletionListener { it.release(); file.delete() }
+                        player.setOnErrorListener { playback, _, _ -> playback.release(); file.delete(); true }
+                        player.prepareAsync()
+                        player.setOnPreparedListener { it.start() }
+                    }.isSuccess
+                    if (started) return
+                    player.release()
+                    file.delete()
+                }
             }
         }
     }
@@ -554,11 +627,17 @@ private suspend fun submit(
     tts.speak(reply.take(300), TextToSpeech.QUEUE_FLUSH, null, "reply")
 }
 
-private class WavHold(private val file: File, private val onLevel: (Float) -> Unit) {
+private val WRITE_TOOLS = setOf(
+    "record_weight", "record_sleep", "record_diet", "record_calisthenics",
+    "bump_learning_module", "set_hard_module", "add_learning_module", "remember",
+)
+
+internal class WavHold(private val file: File, private val onLevel: (Float) -> Unit) {
     private val running = AtomicBoolean(false)
     private var thread: Thread? = null
     fun start() {
         file.parentFile?.mkdirs()
+        file.delete()
         running.set(true)
         thread = Thread {
             val rate = 16000

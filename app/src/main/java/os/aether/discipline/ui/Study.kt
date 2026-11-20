@@ -41,21 +41,21 @@ fun StudyScreen(repo: AetherRepository, nav: NavHostController) {
     var target by remember { mutableStateOf("3") }
     var template by remember { mutableStateOf("DAILY_QUOTA") }
     LaunchedEffect(Unit) {
-        modules = repo.modules()
+        repo.observeToday().collect { modules = repo.modules() }
+    }
+    LaunchedEffect(Unit) {
         board = runCatching { repo.refreshCrypto() }.getOrDefault(board)
     }
     ScreenColumn {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Column {
-                Text("学习与训练实验室", color = LocalAether.current.textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Quiet("按当前阶段排序、归档，或改绑防断链硬指标")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.weight(1f)) {
+                PageTitle("学习", "练习、训练与每日目标")
             }
             AccentButton(if (editing) "完成" else "编辑模块") { editing = !editing }
         }
         if (editing) {
             GlassCard {
-                Body("编辑模式")
-                Quiet("归档只是从日常视图隐藏，历史记录还在。")
+                Quiet("选择一个模块计入今日的学习硬指标。")
                 AccentButton("新建学习模块") { showNew = true }
             }
         }
@@ -64,9 +64,9 @@ fun StudyScreen(repo: AetherRepository, nav: NavHostController) {
                 OutlinedTextField(title, { title = it }, label = { Text("名称") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(target, { target = it.filter(Char::isDigit) }, label = { Text("每日目标") }, modifier = Modifier.fillMaxWidth())
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    AccentButton("定量") { template = "DAILY_QUOTA" }
-                    AccentButton("倒计时") { template = "COUNTDOWN_SPRINT" }
-                    AccentButton("行情") { template = "CRYPTO_TRACKER" }
+                    AccentButton(if (template == "DAILY_QUOTA") "· 定量" else "定量") { template = "DAILY_QUOTA" }
+                    AccentButton(if (template == "COUNTDOWN_SPRINT") "· 倒计时" else "倒计时") { template = "COUNTDOWN_SPRINT" }
+                    AccentButton(if (template == "CRYPTO_TRACKER") "· 行情" else "行情") { template = "CRYPTO_TRACKER" }
                 }
                 AccentButton("添加") {
                     scope.launch {
@@ -82,7 +82,8 @@ fun StudyScreen(repo: AetherRepository, nav: NavHostController) {
             GlassCard {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Column(Modifier.weight(1f)) {
-                        Body(module.title + if (module.countsTowardsStreak) "  [硬指标]" else "")
+                        SectionTitle(module.title)
+                        if (module.countsTowardsStreak && !module.isArchived) Quiet("今日学习硬指标")
                         Quiet(module.subtitle)
                     }
                 }
@@ -100,21 +101,21 @@ fun StudyScreen(repo: AetherRepository, nav: NavHostController) {
                     }
                     Quiet("恐慌贪婪 ${board.fearGreed}")
                     board.headlines.forEach { Quiet(it.take(90)) }
-                    AccentButton("今日复盘完成") { scope.launch { repo.markCryptoReviewed(); modules = repo.modules() } }
-                } else {
-                    val ratio = (module.currentValue / module.targetValue.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
-                    Metric("${module.currentValue} / ${module.targetValue} ${module.unit}", size = 20)
-                    BoxTrack(ratio)
+                }
+                val ratio = (module.currentValue / module.targetValue.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+                Metric("${module.currentValue} / ${module.targetValue} ${module.unit}", size = 20)
+                BoxTrack(ratio)
+                if (!module.isArchived) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        AccentButton("打开") {
-                            when (module.moduleId) {
-                                "driving" -> nav.navigate("driving")
-                                "english" -> nav.navigate("english")
-                                "fitness" -> nav.navigate("calisthenics")
+                        when (module.moduleId) {
+                            "driving" -> AccentButton("进入练习") { nav.navigate("driving") }
+                            "english" -> AccentButton("进入跟读") { nav.navigate("english") }
+                            "fitness" -> AccentButton("打开训练") { nav.navigate("workout") }
+                            else -> if (module.currentValue < module.targetValue) {
+                                AccentButton(if (module.templateType == "CRYPTO_TRACKER") "记录一次复盘" else "记录一次") {
+                                    scope.launch { repo.bumpModule(module.moduleId, 1) }
+                                }
                             }
-                        }
-                        if (module.moduleId != "driving" && module.moduleId != "english") {
-                            AccentButton("+1") { scope.launch { repo.bumpModule(module.moduleId, 1); modules = repo.modules() } }
                         }
                     }
                 }
@@ -122,8 +123,10 @@ fun StudyScreen(repo: AetherRepository, nav: NavHostController) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
                         AccentButton("上移") { scope.launch { repo.moveModule(module.moduleId, -1); modules = repo.modules() } }
                         AccentButton("下移") { scope.launch { repo.moveModule(module.moduleId, 1); modules = repo.modules() } }
-                        AccentButton(if (module.countsTowardsStreak) "已是硬指标" else "设为硬指标") {
-                            scope.launch { repo.setHardModule(module.moduleId); modules = repo.modules() }
+                        if (!module.countsTowardsStreak && !module.isArchived) {
+                            AccentButton("设为硬指标") {
+                                scope.launch { repo.setHardModule(module.moduleId) }
+                            }
                         }
                         AccentButton(if (module.isArchived) "恢复" else "归档") {
                             scope.launch { repo.setArchived(module.moduleId, !module.isArchived); modules = repo.modules() }

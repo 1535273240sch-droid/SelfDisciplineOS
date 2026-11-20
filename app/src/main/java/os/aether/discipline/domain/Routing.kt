@@ -224,7 +224,12 @@ fun localFallbackPlan(ctx: PlanContext): DailyPlan {
             append(" ")
             append(unit)
         }
-        if (ctx.sleepLate && scaled < target) append("（已按状态下调）")
+        if (ctx.sleepLate && scaled < target) {
+            append("（先下调单次任务量，今日达标仍需 ")
+            append(target)
+            append(unit)
+            append("）")
+        }
     }.trim()
     val train = if (ctx.sleepLate) {
         "睡眠不足，训练改为 20 分钟散步"

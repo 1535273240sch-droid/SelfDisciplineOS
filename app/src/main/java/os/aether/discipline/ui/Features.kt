@@ -49,7 +49,6 @@ import os.aether.discipline.content.stepOf
 import os.aether.discipline.data.AetherRepository
 import os.aether.discipline.data.db.DrivingQuestion
 import os.aether.discipline.domain.SyllabusGaps
-import os.aether.discipline.domain.mealTypeFor
 import os.aether.discipline.domain.paceLabel
 import os.aether.discipline.domain.similarity
 import os.aether.discipline.domain.wordDiff
@@ -65,8 +64,6 @@ import os.aether.discipline.system.openExactAlarm
 import os.aether.discipline.system.openOverlay
 import os.aether.discipline.system.openUsage
 import os.aether.discipline.system.usageAllowed
-import java.time.LocalDate
-import java.time.LocalTime
 import java.util.Locale
 
 @Composable
@@ -76,7 +73,8 @@ fun DrivingScreen(repo: AetherRepository) {
     var mock by remember { mutableStateOf(false) }
     var questions by remember { mutableStateOf<List<DrivingQuestion>>(emptyList()) }
     var index by remember { mutableIntStateOf(0) }
-    var picked by remember { mutableStateOf("") }
+    var picked by remember { mutableStateOf(emptySet<String>()) }
+    var answered by remember { mutableStateOf<Boolean?>(null) }
     var correct by remember { mutableIntStateOf(0) }
     var explain by remember { mutableStateOf("") }
     var done by remember { mutableStateOf(false) }
@@ -99,67 +97,96 @@ fun DrivingScreen(repo: AetherRepository) {
         if (done && sessionMock && questions.isNotEmpty()) repo.finishMock(sessionSubject, questions.size, correct)
     }
     ScreenColumn {
+        PageTitle("驾考练习")
         Quiet("驾考 · 内置题按公开的 163/172 号令口径，不是商业题库")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AccentButton(if (subject == 1) "科一 ·" else "科一") { subject = 1 }
             AccentButton(if (subject == 4) "科四 ·" else "科四") { subject = 4 }
             AccentButton(if (mock) "模考中" else "模考") { mock = !mock; left = if (subject == 4) 30 * 60 else 45 * 60 }
         }
-        AccentButton("开始") {
+        AccentButton(if (questions.isNotEmpty() && !done) "重新开始" else "开始练习") {
+            if (submitting) return@AccentButton
+            submitting = true
             scope.launch {
-                questions = repo.paper(subject, mock)
-                index = 0
-                correct = 0
-                done = false
-                explain = ""
-                picked = ""
-                submitting = false
-                sessionMock = mock
-                sessionSubject = subject
-                left = if (subject == 4) 30 * 60 else 45 * 60
-                session += 1
-                val target = repo.loadThresholds().dailyDriving
-                note = if (repo.db.driving().count() < target) "题库少于今日题量，会按现有题目循环。" else ""
+                val selectedSubject = subject
+                val selectedMode = mock
+                try {
+                    questions = repo.paper(selectedSubject, selectedMode)
+                    index = 0
+                    correct = 0
+                    done = false
+                    explain = ""
+                    picked = emptySet()
+                    answered = null
+                    sessionMock = selectedMode
+                    sessionSubject = selectedSubject
+                    left = if (selectedSubject == 4) 30 * 60 else 45 * 60
+                    session += 1
+                    note = if (questions.isEmpty()) "本题库没有所选科目的题目。" else ""
+                } finally {
+                    submitting = false
+                }
             }
         }
         if (sessionMock && questions.isNotEmpty() && !done) Quiet("剩余 ${left / 60}:${"%02d".format(left % 60)}")
         if (note.isNotBlank()) Quiet(note)
         val question = questions.getOrNull(index)
-        if (question == null && questions.isNotEmpty() || done) {
+        if ((question == null && questions.isNotEmpty()) || done) {
             Body(if (questions.isEmpty()) "题库还是空的" else "这组 ${correct}/${questions.size}")
         }
         if (question != null && !done) {
             GlassCard {
+                Quiet("第 ${index + 1} / ${questions.size} 题")
                 Body(question.content)
+                val multiple = question.questionType.contains("MULTI", ignoreCase = true) ||
+                    question.questionType.contains("多选") || question.correctAnswer.count { it in 'A'..'D' } > 1
                 optionsOf(question.optionsJson).forEach { option ->
                     val key = optionKey(option)
-                    Text(option, color = if (picked == key) LocalAether.current.accent else LocalAether.current.textPrimary, modifier = Modifier.padding(vertical = 6.dp).clickable { picked = key })
+                    val colors = LocalAether.current
+                    Text(
+                        option, color = if (key in picked) colors.accent else colors.textPrimary,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                            .background(if (key in picked) colors.accentSoft else androidx.compose.ui.graphics.Color.Transparent)
+                            .clickable(enabled = answered == null && !submitting) {
+                                picked = if (!multiple) setOf(key) else if (key in picked) picked - key else picked + key
+                            }
+                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                    )
                 }
-                AccentButton("确认") {
-                    if (picked.isNotBlank() && !submitting) {
+                val currentAnswer = answered
+                if (currentAnswer == null) {
+                    PrimaryButton("确认答案", enabled = picked.isNotEmpty() && !submitting) {
                         submitting = true
                         scope.launch {
                             try {
-                                val ok = repo.answer(question, setOf(picked), if (sessionMock) "MOCK" else "DAILY")
-                                if (ok) correct += 1 else explain = question.officialExplanation
-                                picked = ""
-                                if (index + 1 >= questions.size) done = true else index += 1
+                                val ok = repo.answer(question, picked, if (sessionMock) "MOCK" else "DAILY")
+                                if (ok) correct += 1
+                                answered = ok
+                                explain = question.officialExplanation
                             } finally {
                                 submitting = false
                             }
                         }
                     }
-                }
-                if (explain.isNotBlank()) {
-                    Quiet(explain)
-                    AccentButton("AI 拆解") {
+                } else {
+                    Quiet(if (currentAnswer) "回答正确" else "正确答案 ${question.correctAnswer}")
+                    if (explain.isNotBlank()) Quiet(explain)
+                    if (explain.isNotBlank()) AccentButton("AI 拆解") {
+                        val explainedIndex = index
                         scope.launch {
                             val bound = repo.bound("companion")
-                            explain = if (bound == null) question.officialExplanation else {
+                            val explanation = if (bound == null) question.officialExplanation else {
                                 val messages = JSONArray().put(JSONObject().put("role", "user").put("content", "只解释这道已有题目，不要出新题。用大白话讲扣分逻辑，再给一句顺口溜。\n${question.content}\n${question.optionsJson}\n答案 ${question.correctAnswer}\n${question.officialExplanation}"))
                                 repo.ai.chat(bound.provider.baseUrl, bound.key, bound.model, messages, temperature = 0.4).content.ifBlank { question.officialExplanation }
                             }
+                            if (index == explainedIndex && answered != null) explain = explanation
                         }
+                    }
+                    PrimaryButton(if (index + 1 >= questions.size) "完成练习" else "下一题") {
+                        answered = null
+                        picked = emptySet()
+                        explain = ""
+                        if (index + 1 >= questions.size) done = true else index += 1
                     }
                 }
             }
@@ -180,73 +207,142 @@ fun DrivingScreen(repo: AetherRepository) {
 fun EnglishScreen(repo: AetherRepository) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val colors = LocalAether.current
     val tts = remember { TextToSpeech(context, null) }
-    DisposableEffect(Unit) { onDispose { tts.shutdown() } }
-    val mic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val recorder = remember { WavHold(java.io.File(context.cacheDir, "english/practice.wav")) {} }
+    var recording by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
     var rate by remember { mutableStateOf(1f) }
-    var index by remember { mutableIntStateOf(0) }
-    var score by remember { mutableStateOf("") }
-    var target by remember { mutableIntStateOf(5) }
+    var note by remember { mutableStateOf("") }
     var daily by remember { mutableStateOf(emptyList<Phrase>()) }
+    var completed by remember { mutableStateOf(emptySet<String>()) }
+    DisposableEffect(Unit) {
+        onDispose {
+            tts.shutdown()
+            recorder.stop().delete()
+        }
+    }
     LaunchedEffect(Unit) {
-        val t = repo.loadThresholds()
-        target = t.dailyEnglish
-        daily = repo.dailyPhrases(count = target)
+        daily = repo.dailyPhrases(count = repo.loadThresholds().dailyEnglish)
+        completed = repo.db.english().forDate(AetherRepository.todayString()).map { it.sentence }.toSet()
     }
-    if (daily.isEmpty()) {
-        ScreenColumn { Quiet("正在加载今日句子") }
-        return
+    val phrase = daily.firstOrNull { it.english !in completed }
+    fun startRecording() {
+        if (busy || recording || phrase == null) return
+        note = ""
+        recorder.start()
+        recording = true
     }
-    val phrase = daily[index % daily.size]
-    ScreenColumn {
-        Quiet(phrase.scene)
-        Metric(phrase.english)
-        Body(phrase.chinese)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            AccentButton("1.0x") { rate = 1f }
-            AccentButton("0.75x") { rate = 0.75f }
-            AccentButton("听") {
-                tts.language = Locale.US
-                tts.setSpeechRate(rate)
-                tts.speak(phrase.english, TextToSpeech.QUEUE_FLUSH, null, phrase.id)
+    val mic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startRecording() else note = "未授权麦克风，可以手动确认跟读。"
+    }
+    fun saveResult(practice: Phrase, score: Int, message: String) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            try {
+                repo.logEnglish(practice.scene, practice.english, score)
+                note = message
+                completed = completed + practice.english
+            } finally {
+                busy = false
             }
         }
-        AccentButton("先允许麦克风") { mic.launch(Manifest.permission.RECORD_AUDIO) }
-        Quiet("按住底部语音键读这一句，再回来评分。评分只比较转写和原句。")
-        AccentButton("用刚才的录音评分") {
-            scope.launch {
+    }
+    fun finishRecording() {
+        val practice = phrase ?: return
+        if (!recording || busy) return
+        recording = false
+        busy = true
+        scope.launch {
+            try {
+                val file = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { recorder.stop() }
                 val bound = repo.bound("transcribe")
-                val file = java.io.File(context.cacheDir, "voice/hold.wav")
-                if (bound == null || !file.exists()) {
-                    score = "先绑定转写，并在语音页按住读完这一句"
+                if (bound == null) {
+                    note = "语音评分需要绑定转写模型。你可以手动确认完成。"
                     return@launch
                 }
-                val heard = runCatching { repo.ai.transcribe(bound.provider.baseUrl, bound.key, bound.path, bound.model, file) }.getOrDefault("")
+                if (file.length() <= 1000L) {
+                    note = "没有录到这一句，请重试。"
+                    return@launch
+                }
+                val heard = repo.ai.transcribe(bound.provider.baseUrl, bound.key, bound.path, bound.model, file)
                 if (heard.isBlank()) {
-                    score = "没听清，再读一次。"
+                    note = "没听清，请再读一次。"
                     return@launch
                 }
-                val value = similarity(phrase.english, heard)
-                score = "$value  $heard\n${wordDiff(phrase.english, heard)}"
-                repo.logEnglish(phrase.scene, phrase.english, value)
-                if (index + 1 < daily.size) index += 1
+                val score = similarity(practice.english, heard)
+                repo.logEnglish(practice.scene, practice.english, score)
+                note = "$score 分 · $heard\n${wordDiff(practice.english, heard)}"
+                completed = completed + practice.english
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                note = "语音评分失败，可重试或手动确认完成。"
+            } finally {
+                busy = false
+                recorder.stop().delete()
             }
         }
-        if (score.isNotBlank()) Quiet(score)
-        Quiet("今日 ${minOf(index, target)}/$target")
+    }
+    LaunchedEffect(recording) {
+        if (recording) {
+            delay(30_000)
+            finishRecording()
+        }
+    }
+    ScreenColumn {
+        PageTitle("场景英语", "今日 ${daily.count { it.english in completed }} / ${daily.size} 句")
+        if (note.isNotBlank()) GlassCard { Body(note) }
+        when {
+            daily.isEmpty() -> Quiet("正在读取今日练习…")
+            phrase == null -> GlassCard { SectionTitle("今日跟读已完成") }
+            else -> GlassCard {
+                Quiet(phrase.scene)
+                SectionTitle(phrase.english)
+                Body(phrase.chinese)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    AccentButton(if (rate == 1f) "1.0× ·" else "1.0×") { rate = 1f }
+                    AccentButton(if (rate == 0.75f) "0.75× ·" else "0.75×") { rate = 0.75f }
+                    AccentButton("听发音") {
+                        if (!recording) {
+                            tts.language = Locale.US
+                            tts.setSpeechRate(rate)
+                            tts.speak(phrase.english, TextToSpeech.QUEUE_FLUSH, null, phrase.id)
+                        }
+                    }
+                }
+                PrimaryButton(
+                    if (recording) "结束录音并评分" else if (busy) "处理中…" else "录音评分",
+                    enabled = !busy,
+                ) {
+                    if (recording) finishRecording()
+                    else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                    ) startRecording()
+                    else mic.launch(Manifest.permission.RECORD_AUDIO)
+                }
+                if (!recording && !busy) {
+                    AccentButton("确认已跟读") { saveResult(phrase, 0, "已记录跟读") }
+                }
+            }
+        }
     }
 }
 
+
 @Composable
-fun WorkoutScreen() {
+fun WorkoutScreen(onStrength: () -> Unit) {
     val context = LocalContext.current
     val live by os.aether.discipline.system.WorkoutBus.state.collectAsStateWithLifecycle()
     var pendingType by remember { mutableStateOf("RUN") }
+    var permissionNote by remember { mutableStateOf("") }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
-        if (granted[Manifest.permission.ACCESS_FINE_LOCATION] == true) startWorkout(context, pendingType)
+        if (granted[Manifest.permission.ACCESS_FINE_LOCATION] == true) startWorkout(context, pendingType) else permissionNote = "需要精确定位权限才能记录轨迹。"
     }
     ScreenColumn {
-        Quiet(if (live.type == "WALK") "散步" else "跑步")
+        PageTitle("训练", "跑步、散步与力量训练")
+        SectionTitle(if (live.type == "WALK") "散步" else "跑步")
         Metric(if (live.meters <= 0f) "0.00" else "%.2f".format(live.meters / 1000f))
         Quiet("公里 · ${paceLabel(live.meters, live.seconds)} · ${live.seconds / 60}分 · 步频 ${live.cadence}")
         val colors = LocalAether.current
@@ -263,20 +359,24 @@ fun WorkoutScreen() {
             drawCircle(colors.accent, 6f, Offset(x(live.points.last().second), y(live.points.last().first)))
         }
         if (live.message.isNotBlank()) Quiet(live.message)
+        if (permissionNote.isNotBlank()) Quiet(permissionNote)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            AccentButton("跑") {
+            if (!live.active) AccentButton("开始跑步") {
+                permissionNote = ""
                 pendingType = "RUN"
-                permission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACTIVITY_RECOGNITION, Manifest.permission.POST_NOTIFICATIONS))
+                permission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACTIVITY_RECOGNITION, Manifest.permission.POST_NOTIFICATIONS))
             }
-            AccentButton("走") {
+            if (!live.active) AccentButton("开始散步") {
+                permissionNote = ""
                 pendingType = "WALK"
-                permission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACTIVITY_RECOGNITION, Manifest.permission.POST_NOTIFICATIONS))
+                permission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACTIVITY_RECOGNITION, Manifest.permission.POST_NOTIFICATIONS))
             }
-            AccentButton("结束") {
+            if (live.active) AccentButton("结束并保存") {
                 context.startService(Intent(context, LocationService::class.java).putExtra("stop", true))
             }
         }
-        Quiet("轨迹只留在手机上，不会放进 AI 的提示词。")
+        Quiet("轨迹保存在手机上。")
+        PrimaryButton("打开囚徒健身", onClick = onStrength)
     }
 }
 
@@ -293,7 +393,7 @@ fun CalisthenicsScreen(repo: AetherRepository) {
     var note by remember { mutableStateOf("") }
     LaunchedEffect(Unit) { rows = repo.db.calisthenics().all() }
     ScreenColumn {
-        Quiet("囚徒健身 · 语音也可以直接说「第五式俯卧撑 2 组 20 个」")
+        PageTitle("囚徒健身", "输入组数和每组次数，保存后更新训练进度。")
         rows.forEach { row ->
             val gate = stepOf(row.moveCategory, row.currentStep)
             GlassCard {
@@ -324,6 +424,7 @@ fun ThresholdScreen(repo: AetherRepository) {
     var pinNote by remember { mutableStateOf("") }
     var saveNote by remember { mutableStateOf("") }
     ScreenColumn {
+        PageTitle("数据与阈值")
         Quiet("改完立即影响仪表盘和判定")
         OutlinedTextField(pin, { if (it.length <= 6) pin = it.filter(Char::isDigit) }, label = { Text("6 位紧急密码") })
         AccentButton("保存密码") { scope.launch { pinNote = repo.setPin(pin) } }
@@ -352,93 +453,13 @@ fun ThresholdScreen(repo: AetherRepository) {
 }
 
 @Composable
-fun BackfillScreen(repo: AetherRepository) {
-    val scope = rememberCoroutineScope()
-    var date by remember { mutableStateOf(LocalDate.now().minusDays(1).toString()) }
-    var weight by remember { mutableStateOf("") }
-    var sleep by remember { mutableStateOf("") }
-    var wake by remember { mutableStateOf("") }
-    var food by remember { mutableStateOf("") }
-    var calories by remember { mutableStateOf("") }
-    var note by remember { mutableStateOf("") }
-    val clock = Regex("^([01]?\\d|2[0-3]):[0-5]\\d$")
-    fun pastDate(day: String): Boolean =
-        runCatching { LocalDate.parse(day) }.getOrNull()?.isBefore(LocalDate.now()) == true
-    ScreenColumn {
-        Quiet("补录只进趋势与图表，不算当日达标，也不会把已经断掉的天数补回来。")
-        OutlinedTextField(date, { date = it }, label = { Text("日期 YYYY-MM-DD") }, modifier = Modifier.fillMaxWidth())
-        Quiet("体重（空腹）")
-        OutlinedTextField(weight, { weight = it }, label = { Text("kg") }, modifier = Modifier.fillMaxWidth())
-        AccentButton("补录体重") {
-            scope.launch {
-                val day = date.trim()
-                val kg = weight.toFloatOrNull()
-                when {
-                    !pastDate(day) -> note = "日期要早于今天"
-                    kg == null || kg !in 30f..250f -> note = "体重要在 30–250kg"
-                    else -> {
-                        repo.recordWeight(kg, true, "BACKFILL", backfill = true, date = day)
-                        note = "已补录 $day 体重"
-                    }
-                }
-            }
-        }
-        Quiet("作息（昨晚）")
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(sleep, { sleep = it }, label = { Text("入睡 HH:mm") }, modifier = Modifier.weight(1f))
-            OutlinedTextField(wake, { wake = it }, label = { Text("起床 HH:mm") }, modifier = Modifier.weight(1f))
-        }
-        AccentButton("补录作息") {
-            scope.launch {
-                val day = date.trim()
-                when {
-                    !pastDate(day) -> note = "日期要早于今天"
-                    !clock.matches(sleep.trim()) -> note = "入睡时间要写成 HH:mm"
-                    wake.isNotBlank() && !clock.matches(wake.trim()) -> note = "起床时间要写成 HH:mm"
-                    else -> {
-                        repo.recordSleep(sleep.trim(), wake.trim().ifBlank { null }, sourceBackfill = true, date = day)
-                        note = "已补录 $day 作息"
-                    }
-                }
-            }
-        }
-        Quiet("饮食")
-        OutlinedTextField(food, { food = it }, label = { Text("吃了什么") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(calories, { calories = it.filter(Char::isDigit) }, label = { Text("热量 kcal（可空）") }, modifier = Modifier.fillMaxWidth())
-        AccentButton("补录饮食") {
-            scope.launch {
-                val day = date.trim()
-                when {
-                    !pastDate(day) -> note = "日期要早于今天"
-                    food.isBlank() -> note = "先写吃了什么"
-                    else -> {
-                        repo.recordDiet(
-                            mealTypeFor(LocalTime.now().hour),
-                            food,
-                            calories.toIntOrNull() ?: 0,
-                            0f,
-                            0f,
-                            0f,
-                            needsBackfill = calories.isBlank(),
-                            backfill = true,
-                            date = day,
-                        )
-                        note = "已补录 $day 饮食"
-                    }
-                }
-            }
-        }
-        if (note.isNotBlank()) Quiet(note)
-    }
-}
-
-@Composable
 fun RootScreen(repo: AetherRepository) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var log by remember { mutableStateOf("") }
     var risk by remember { mutableStateOf("") }
     ScreenColumn {
+        PageTitle("Root 与锁屏")
         val owner = DeviceOwnerCtl.isOwner(context)
         Body(if (owner) "当前强度：Device Owner 真拦" else "当前强度：降级，遮罩加记账")
         Quiet("su ${if (Root.available()) "可用" else "不可用"}")

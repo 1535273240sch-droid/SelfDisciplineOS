@@ -140,6 +140,7 @@ class RoutingTest {
         assertTrue(late.items[0].contains("20 分钟散步"))
         assertTrue(late.items[1].contains("80"))
         assertTrue(late.items[1].contains("下调"))
+        assertTrue(late.items[1].contains("达标仍需 100题"))
         assertTrue(late.items.any { it.contains("2000") })
         assertTrue(late.note.contains("睡眠"))
 

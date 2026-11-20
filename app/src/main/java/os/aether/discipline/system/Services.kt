@@ -19,8 +19,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import os.aether.discipline.AetherApp
 import os.aether.discipline.data.db.GpsWorkout
 import os.aether.discipline.domain.AlwaysLockPackages
@@ -50,29 +52,39 @@ object WorkoutBus {
 class LocationService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var job: Job? = null
+    private var stopping = false
     private var stepsStart = -1
     private var lastSteps = 0
+    private var stepListener: SensorEventListener? = null
 
     override fun onBind(intent: Intent?) = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startAsForeground("正在记录轨迹")
         if (intent?.getBooleanExtra("stop", false) == true) {
+            if (stopping) return START_NOT_STICKY
+            val activeJob = job ?: return START_NOT_STICKY.also { stopSelf() }
+            stopping = true
             scope.launch {
-                finish()
-                stopSelf()
+                try {
+                    activeJob.cancelAndJoin()
+                    finish()
+                } finally {
+                    stopSelf()
+                }
             }
             return START_NOT_STICKY
         }
+        if (stopping || job?.isActive == true) return START_STICKY
         val type = intent?.getStringExtra("type") ?: "RUN"
         val resumed = intent == null
-        job?.cancel()
         job = scope.launch { track(type, resumed) }
         return START_STICKY
     }
 
     override fun onDestroy() {
         scope.cancel()
+        stepListener?.let { getSystemService(SensorManager::class.java).unregisterListener(it) }
         super.onDestroy()
     }
 
@@ -82,6 +94,7 @@ class LocationService : Service() {
         val date = os.aether.discipline.data.AetherRepository.todayString()
         // A START_STICKY restart must attach to the unfinished row instead of creating a duplicate.
         val existing = if (resumed) app.repo.db.gps().latest()?.takeIf { !it.finished } else null
+        val workoutType = existing?.workoutType ?: type
         val id = existing?.id ?: app.repo.db.gps().insert(
             GpsWorkout(
                 date = date,
@@ -94,9 +107,15 @@ class LocationService : Service() {
                 routeGeoJson = """{"type":"LineString","coordinates":[]}""",
             ),
         )
-        WorkoutBus.state.value = WorkoutLive(active = true, id = id, type = type)
+        WorkoutBus.state.value = WorkoutLive(active = true, id = id, type = workoutType, meters = existing?.distanceMeters ?: 0f)
         val started = existing?.startTime ?: System.currentTimeMillis()
-        val points = mutableListOf<Pair<Double, Double>>()
+        val points = runCatching {
+            val coords = org.json.JSONObject(existing?.routeGeoJson.orEmpty()).getJSONArray("coordinates")
+            MutableList(coords.length()) { index ->
+                val pair = coords.getJSONArray(index)
+                pair.getDouble(1) to pair.getDouble(0)
+            }
+        }.getOrDefault(mutableListOf())
         var meters = existing?.distanceMeters ?: 0f
         listenSteps()
         val client = runCatching { LocationServices.getFusedLocationProviderClient(this) }.getOrElse {
@@ -123,23 +142,25 @@ class LocationService : Service() {
                 val seconds = (System.currentTimeMillis() - started) / 1000
                 val minutes = (seconds / 60f).coerceAtLeast(1f / 60f)
                 val cadence = if (lastSteps > stepsStart && stepsStart >= 0) ((lastSteps - stepsStart) / minutes).toInt() else 0
-                WorkoutBus.state.value = WorkoutLive(true, id, type, meters, seconds, points.toList(), cadence)
+                WorkoutBus.state.value = WorkoutLive(true, id, workoutType, meters, seconds, points.toList(), cadence)
                 if (points.size % 5 == 0) {
                     val snapshot = points.toList()
-                    scope.launch(Dispatchers.IO) { persist(app, id, type, meters, seconds, snapshot, cadence, false) }
+                    val distance = meters
+                    scope.launch { persist(app, id, workoutType, distance, seconds, snapshot, cadence, false) }
                 }
             }
         }
-        val startedUpdates = runCatching {
-            client.requestLocationUpdates(request, callback, mainLooper)
-        }
-        if (startedUpdates.isFailure) {
+        try {
+            client.requestLocationUpdates(request, callback, mainLooper).await()
+            kotlinx.coroutines.awaitCancellation()
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
             WorkoutBus.state.value = WorkoutLive(message = "定位权限或定位服务不可用")
             stopSelf()
-            return
+        } finally {
+            client.removeLocationUpdates(callback)
         }
-        // location updates stay registered until the service stops
-        kotlinx.coroutines.awaitCancellation()
     }
 
     private suspend fun finish() {
@@ -148,11 +169,13 @@ class LocationService : Service() {
         val id = live.id.takeIf { it != 0L }
             ?: app.repo.db.gps().latest()?.takeIf { !it.finished }?.id
             ?: return
-        persist(app, id, live.type, live.meters, live.seconds, live.points, live.cadence, true)
-        val pace = paceLabel(live.meters, live.seconds)
+        val row = app.repo.db.gps().get(id) ?: return
+        val elapsed = maxOf(live.seconds, (System.currentTimeMillis() - row.startTime) / 1000)
+        persist(app, id, live.type, live.meters, elapsed, live.points, live.cadence, true)
+        val pace = paceLabel(live.meters, elapsed)
         val kind = if (live.type == "RUN") "跑了" else "走了"
         app.repo.saveMessage("ASSISTANT", "今天$kind ${"%.2f".format(live.meters / 1000f)} 公里，配速 $pace。")
-        WorkoutBus.state.value = WorkoutLive()
+        WorkoutBus.state.value = live.copy(active = false, seconds = elapsed, message = "训练已保存")
     }
 
     private suspend fun persist(
@@ -170,7 +193,7 @@ class LocationService : Service() {
             ?: app.repo.loadThresholds().targetWeightKg
             ?: 70f
         val coords = points.joinToString(",") { "[${it.second},${it.first}]" }
-        app.repo.db.gps().update(
+        app.repo.saveWorkout(
             row.copy(
                 durationSec = seconds,
                 distanceMeters = meters,
@@ -186,14 +209,17 @@ class LocationService : Service() {
     private fun listenSteps() {
         val manager = getSystemService(SensorManager::class.java)
         val sensor = manager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) ?: return
-        manager.registerListener(object : SensorEventListener {
+        val listener = object : SensorEventListener {
             override fun onSensorChanged(event: SensorEvent) {
                 val value = event.values.firstOrNull()?.toInt() ?: return
                 if (stepsStart < 0) stepsStart = value
                 lastSteps = value
             }
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
-        }, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+        if (runCatching { manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL) }.getOrDefault(false)) {
+            stepListener = listener
+        }
     }
 
     private fun startAsForeground(text: String) {

@@ -33,7 +33,6 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.navigation.NavHostController
 import kotlinx.coroutines.launch
 import os.aether.discipline.data.AetherRepository
 import os.aether.discipline.data.SceneBinding
@@ -50,7 +49,7 @@ private val scenes = listOf(
 )
 
 @Composable
-fun ProviderScreen(repo: AetherRepository, nav: NavHostController) {
+fun ProviderScreen(repo: AetherRepository) {
     val providers by repo.providers.collectAsStateWithLifecycle(emptyList())
     val scope = rememberCoroutineScope()
     val colors = LocalAether.current
@@ -98,18 +97,7 @@ fun ProviderScreen(repo: AetherRepository, nav: NavHostController) {
     }
 
     ScreenColumn(spacing = 14.dp) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "‹",
-                color = colors.textPrimary,
-                fontSize = 26.sp,
-                modifier = Modifier.clickable { nav.popBackStack() }.padding(end = 10.dp),
-            )
-            Column {
-                Text("模型接入", color = colors.textPrimary, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-                Quiet("AI 是应用的大脑，先完成一次连通测试。")
-            }
-        }
+        PageTitle("模型接入", "配置服务商，再为六个场景选择模型。")
         if (providers.size > 1 || editingId != null) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 providers.forEach { provider ->
