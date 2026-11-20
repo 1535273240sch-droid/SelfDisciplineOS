@@ -72,8 +72,8 @@ data class AetherColors(
     val surfaceStrong = if (dark) Color(0xEB202634) else Color(0xEBFFFFFF)
     val accentSoft = accent.copy(alpha = if (dark) 0.18f else 0.09f)
     val onAccent = if (dark) Color(0xFF101620) else Color.White
-    val rimHighlight = Color.White.copy(alpha = if (dark) 0.52f else 0.98f)
-    val rimShade = if (dark) Color.Black.copy(alpha = 0.44f) else accent.copy(alpha = 0.22f)
+    val rimHighlight = Color.White.copy(alpha = if (dark) 0.38f else 0.86f)
+    val rimShade = if (dark) Color.Black.copy(alpha = 0.27f) else accent.copy(alpha = 0.16f)
     val danger = if (dark) Color(0xFFFFA5A0) else Color(0xFFB3293A)
     val up = if (dark) Color(0xFF8BE8BC) else Color(0xFF16634C)
 }
@@ -229,23 +229,23 @@ internal fun Modifier.glassRim(shape: Shape, colors: AetherColors, floating: Boo
     val inside = shape.createOutline(innerSize, layoutDirection, this)
     val edge = Brush.linearGradient(
         0f to colors.rimHighlight,
-        0.28f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.30f else 0.78f),
+        0.24f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.20f else 0.54f),
         0.66f to colors.rimShade,
         0.88f to colors.rimShade,
-        1f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.28f else 0.70f),
+        1f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.16f else 0.46f),
         start = Offset.Zero,
         end = Offset(size.width * 0.82f, size.height),
     )
     val innerEdge = Brush.linearGradient(
-        0f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.26f else 0.70f),
-        0.34f to Color.Transparent,
-        0.67f to Color.Transparent,
-        1f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.17f else 0.48f),
+        0f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.13f else 0.40f),
+        0.25f to Color.Transparent,
+        0.76f to Color.Transparent,
+        1f to colors.rimHighlight.copy(alpha = if (colors.dark) 0.09f else 0.24f),
         start = Offset.Zero,
         end = Offset(innerSize.width, innerSize.height),
     )
-    val outerStroke = Stroke(if (floating) 2.3.dp.toPx() else 2.dp.toPx())
-    val innerStroke = Stroke(0.8.dp.toPx())
+    val outerStroke = Stroke(if (floating) 1.8.dp.toPx() else 1.5.dp.toPx())
+    val innerStroke = Stroke(0.6.dp.toPx())
     onDrawWithContent {
         drawContent()
         drawOutline(outline, edge, style = outerStroke)
@@ -272,7 +272,7 @@ internal fun Modifier.glassSurface(shape: Shape, floating: Boolean = false, tint
     return clip(shape).then(material)
         .background(
             Brush.verticalGradient(
-                0f to Color.White.copy(alpha = if (colors.dark) 0.092f else 0.38f),
+                0f to Color.White.copy(alpha = if (colors.dark) 0.065f else 0.23f),
                 0.36f to Color.Transparent,
                 1f to colors.accent.copy(alpha = if (colors.dark) 0.042f else 0.032f),
             ),
@@ -296,7 +296,7 @@ fun GlassCard(
 @Composable
 fun DockSurface(modifier: Modifier, content: @Composable BoxScope.() -> Unit) {
     val colors = LocalAether.current
-    val tint = colors.surfaceStrong.copy(alpha = if (colors.dark) 0.56f else 0.70f)
+    val tint = colors.surfaceStrong.copy(alpha = if (colors.dark) 0.48f else 0.57f)
     Box(modifier.glassSurface(CircleShape, floating = true, tint = tint), content = content)
 }
 

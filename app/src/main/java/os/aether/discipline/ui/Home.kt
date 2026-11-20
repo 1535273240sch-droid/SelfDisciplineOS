@@ -194,11 +194,11 @@ private fun FloatingDock(nav: NavHostController, voiceOpen: Boolean, onVoice: ()
                 val center = Offset(x, size.height - 1.dp.toPx())
                 val radius = tabWidth.toPx() * 0.86f
                 val glow = if (colors.dark) colors.accent else colors.glow
-                scale(1f, 0.16f, pivot = center) {
+                scale(1f, 0.105f, pivot = center) {
                     drawCircle(
                         Brush.radialGradient(
-                            0f to glow.copy(alpha = if (colors.dark) 0.72f else 0.64f),
-                            0.40f to glow.copy(alpha = 0.34f),
+                            0f to glow.copy(alpha = if (colors.dark) 0.40f else 0.34f),
+                            0.40f to glow.copy(alpha = 0.16f),
                             1f to glow.copy(alpha = 0f),
                             center = center,
                             radius = radius,
@@ -214,8 +214,8 @@ private fun FloatingDock(nav: NavHostController, voiceOpen: Boolean, onVoice: ()
                     .clip(CircleShape)
                     .background(
                         Brush.verticalGradient(
-                            0f to Color.White.copy(alpha = if (colors.dark) 0.20f else 0.80f),
-                            1f to colors.accent.copy(alpha = if (colors.dark) 0.14f else 0.075f),
+                            0f to Color.White.copy(alpha = if (colors.dark) 0.11f else 0.31f),
+                            1f to colors.accent.copy(alpha = if (colors.dark) 0.07f else 0.035f),
                         ),
                     )
                     .glassRim(CircleShape, colors, floating = false),
